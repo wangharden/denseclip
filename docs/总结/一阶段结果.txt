@@ -1,0 +1,93 @@
+第一步已经落地，目标是把 A1/B 固定到同一份 split manifest 上，避免之前“不是同一批 query 却直接比 AUROC”。
+
+  改动在这几处：
+
+  - C:/Nottingham/DenseCLIP-master/fewshot/data.py
+    新增并统一了 SharedSplitManifest、build_shared_split_manifest(...)、save_shared_split_manifest(...)、
+  load_shared_split_manifest(...)、stage_a1_split_from_manifest(...)、stage_b_split_from_manifest(...)。
+  - C:/Nottingham/DenseCLIP-master/run_stage_a1.py
+    已支持 --split-manifest，并会把实际使用的 split 固化到输出目录。
+  - C:/Nottingham/DenseCLIP-master/run_stage_b.py
+    已支持 --split-manifest，B 现在可以强制读取与 A1 相同的 support/query 列表。
+  - C:/Nottingham/DenseCLIP-master/prepare_split_manifest.py
+    新增共享 split 生成入口。
+  - C:/Nottingham/DenseCLIP-master/generate_split_manifest.py
+    增加了一个同功能的轻量入口，便于直接调用。
+  - C:/Nottingham/DenseCLIP-master/fewshot/__init__.py
+    导出已对齐新的 manifest API。
+
+  回归结果已经确认：
+
+  - 共享 manifest 在 C:/Nottingham/DenseCLIP-master/outputs/shared_split_smoke/hazelnut_split_manifest.json
+    这里固定了 support_normal=8、support_defect=4、query_eval=106。
+  - A1 用这份 manifest 跑出的指标在 C:/Nottingham/DenseCLIP-master/outputs/stage_a1_shared_split_smoke/hazelnut/
+  metrics.json
+    其中 num_test_query=106。
+  - B 用同一份 manifest 跑出的指标在 C:/Nottingham/DenseCLIP-master/outputs/stage_b_shared_split_smoke/hazelnut/
+  metrics.json
+    其中 num_test_query=106。
+
+第二步已经完成，A1/B 现在不仅共用同一份 split，也共用同一套 scoring 规则。
+
+  核心改动在 C:/Nottingham/DenseCLIP-master/fewshot/scoring.py。我把 top-k mean、上采样，以及 logits -> score 的转换都收
+  到了这里。随后接入了 C:/Nottingham/DenseCLIP-master/fewshot/stage_a1.py 和 C:/Nottingham/DenseCLIP-master/fewshot/
+  learned_head.py，并更新了 C:/Nottingham/DenseCLIP-master/run_stage_b.py 的评估路径，让 B 直接读取共享 scoring 输出，不
+  再在脚本里单独做一套 sigmoid + 聚合。导出也同步到了 C:/Nottingham/DenseCLIP-master/fewshot/__init__.py。
+
+  回归已经跑过，仍然用同一份 C:/Nottingham/DenseCLIP-master/outputs/shared_split_smoke/hazelnut_split_manifest.json。
+
+  - A1 新结果在 C:/Nottingham/DenseCLIP-master/outputs/stage_a1_shared_scoring_smoke/hazelnut/metrics.json，
+  num_test_query=106，指标和前一版一致。
+  - B 新结果在 C:/Nottingham/DenseCLIP-master/outputs/stage_b_shared_scoring_smoke/hazelnut/metrics.json，
+  num_test_query=106，指标基本一致，说明这次改动是“规则统一”，不是“方法换了”。
+
+  顺手把这次相关源文件同步到了 C:/Nottingham/DenseCLIP-master/上传的文件，包括 C:/Nottingham/DenseCLIP-master/上传的文
+  件/fewshot/scoring.py、C:/Nottingham/DenseCLIP-master/上传的文件/fewshot/stage_a1.py、C:/Nottingham/DenseCLIP-master/
+  上传的文件/fewshot/learned_head.py、C:/Nottingham/DenseCLIP-master/上传的文件/run_stage_b.py、C:/Nottingham/DenseCLIP-
+  master/上传的文件/prepare_split_manifest.py、C:/Nottingham/DenseCLIP-master/上传的文件/generate_split_manifest.py。
+
+  下一步就该做真正的 A2：在不训练 head 的前提下，引入 defect prototype，然后在同一 split、同一 scoring 下和 A1/B 做干净
+  对照。
+
+  统一 scoring 之后，结果和“统一 split 但未统一 scoring”的那版基本一样。
+  这一步主要是把规则抽成公共模块，没有故意改方法定义。
+
+  具体数字：
+
+  - A1
+      - shared split 后： C:/Nottingham/DenseCLIP-master/outputs/stage_a1_shared_split_smoke/hazelnut/metrics.json
+        image_auroc=0.4431818181818182
+        pixel_auroc=0.5387799028112759
+      - shared scoring 后： C:/Nottingham/DenseCLIP-master/outputs/stage_a1_shared_scoring_smoke/hazelnut/metrics.json
+        image_auroc=0.4431818181818182
+        pixel_auroc=0.5387799028112759
+  - B
+      - shared split 后： C:/Nottingham/DenseCLIP-master/outputs/stage_b_shared_split_smoke/hazelnut/metrics.json
+        image_auroc=0.49924242424242427
+        pixel_auroc=0.50264379252565
+      - shared scoring 后： C:/Nottingham/DenseCLIP-master/outputs/stage_b_shared_scoring_smoke/hazelnut/metrics.json
+        image_auroc=0.49924242424242427
+        pixel_auroc=0.5026435591333527
+
+  结论很直接：
+
+  - 统一 split 会改结果，因为比赛样本变了。
+  - 统一 scoring 基本没改结果，说明这一步只是把规则标准化了，没有引入新的行为漂移。
+ A2 已经落地，入口是 C:/Nottingham/DenseCLIP-master/run_stage_a2.py，核心逻辑在 C:/Nottingham/DenseCLIP-master/fewshot/
+  stage_a2.py。这条线严格按你前面的协议做：normal + defect prototype，冻结 backbone，不训练任何权重，直接在 shared
+  manifest 上评估。为了后续做 scoring-ablation，我顺手把相似度和 score map 的公共逻辑进一步收到了 C:/Nottingham/
+  DenseCLIP-master/fewshot/scoring.py，并让 C:/Nottingham/DenseCLIP-master/fewshot/stage_a1.py 和 C:/Nottingham/
+  DenseCLIP-master/fewshot/learned_head.py 复用同一个 similarity/scoring 基础件。
+
+  先给结果，全部都在同一份 C:/Nottingham/DenseCLIP-master/outputs/shared_split_smoke/hazelnut_split_manifest.json 上，
+  num_test_query=106：
+
+ - A2 默认 score_mode=defect-minus-normal: C:/Nottingham/DenseCLIP-master/outputs/stage_a2_smoke/hazelnut/metrics.json
+    image_auroc=0.4617，pixel_auroc=0.5728
+  - A2 控制项 score_mode=normal-minus-defect: C:/Nottingham/DenseCLIP-master/outputs/stage_a2_smoke_normal_minus_defect/
+  hazelnut/metrics.json
+    image_auroc=0.5462，pixel_auroc=0.4272
+  - A2 score_mode=blend: C:/Nottingham/DenseCLIP-master/outputs/stage_a2_smoke_blend/hazelnut/metrics.json
+    image_auroc=0.4617，pixel_auroc=0.5728
+
+  这次 A2 的结论比单个数字更重要：

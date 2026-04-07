@@ -1,0 +1,85 @@
+According to a document from 2026-04-06，既然你现在**只需要判断一张图是不是异常**，我的结论要直接改成这句：
+
+**Stage 3 主线不该切到“图像+文本联合”，而是应先把当前训练改成纯 image-level 分类校准；文本向量只保留成一条 image-level 备选，不该替代图像主线。** 当前这版 `P2` 的主要问题不是“没有文本”，而是**任务目标已经变成分类，但训练仍在按分割/定位的方式驱动模型**。  
+
+为什么我现在不建议把文本升成主线
+
+你当前 `P2` 的代码是共享 stem 的 dual-head：一支学 pixel residual，一支学 image residual；总损失是 `mask BCE + Dice + image BCE + rank + consistency`，而且 best checkpoint 是按 **support 训练损失最小**来选的。这个设置在“要做分割”时还说得过去，但在“只做异常/正常二分类”时，目标已经明显错位了：训练和选模都在被 pixel 分支牵着走。 
+
+结果也正好支持这一点。`P1 image-head-only` 只比 `E0` 略低一点，整体 `balanced` 是 `0.6862 -> 0.6834`；而修完 contract 之后的 `P2 dual-head` 仍然明显差于 frozen baseline，整体 `balanced` 到 `0.5925`，`bottle` 甚至从 `0.9483` 掉到 `0.7189`。这说明当前最伤结果的，不是“少了文本”，而是**pixel 分支 + 共享 stem + train-loss 选模**这套耦合训练本身。
+
+还有一个很关键的代码事实：当前 `P1` 并不是“保守的 image-only residual calibrator”。它是用 pooled feature 直接预测一个**新的** image logit，预测时直接 `sigmoid(logit)`；没有把 `winner_image_score` 当成显式 identity anchor，也不是围绕 frozen baseline 做小幅残差校准。所以 `P1` 的失败，并不能说明“image-only 方向不行”；它只说明“当前这版全局统计 MLP + train-loss 选模”不够好。
+
+文本方法里，**PromptAD** 是最贴近你现在这个“few-shot、only normal samples、工业异常分类/检测”场景的一篇，但它的有效点是**one-class prompt learning + semantic concatenation + explicit anomaly margin**，不是“把文本向量拼进去就会好”。相对地，**AnomalyCLIP** 是零样本 object-agnostic prompt learning，**AdaptCLIP** 需要先在 base dataset 上训练 adapter，之后才 target-domain training-free，**AF-CLIP** 也建立在 auxiliary anomaly datasets 上的 adapter/prompt 优化之上；这些都更像“通用 CLIP 适配路线”，不是你现在这个最小 target-side 闭环的第一刀。**Sea-CLIP** 的增益也主要来自 DINOv2 语义表征和 anomaly matching decoder，而不是“单纯引入文本”。([arXiv][1])
+
+所以，按你现在的新目标，我会把路线改成下面这样。
+
+## 主线
+
+**直接淘汰当前 dual-head + pixel residual + mask BCE/Dice。**
+
+改成一个**纯 image-level、保守残差式**的小 calibrator。形式上建议是：
+
+`z_final = z_frozen + α(x) · Δ(x)`
+
+其中 `z_frozen` 是把当前 `winner_image_score` 做一次固定 affine calibration 后得到的 frozen logit，`Δ(x)` 是小 head 预测的 image residual，`α(x)` 是一个很小的 gate，初始化接近 0。这样做的重点不是“学一个新分类器”，而是**只允许模型在 frozen baseline 周围做小修正**。这比你现在 `P1` 那种“重新学一个 fresh image score”更稳，也比当前 `P2` 的自由 residual 安全得多。这里我更建议**先做线性 residual calibrator**，而不是再上大一点的 MLP；因为你现在的 support 规模下，先把方向做对，比容量更重要。
+
+输入不要再走 pixel 输出，只保留 image-level 输入：
+
+* 5 个 cached map 的 pooled stats
+* `winner_image_score` 本身
+* 可选再加 1 个 uncertainty 特征，比如 `knn_gap_map` 的 top-k pooled 值
+
+损失只保留 image-level：
+
+* `pairwise ranking loss`
+* `image BCE`
+* `anchor loss`，把高置信样本和 `bottle` 控制类拉回 frozen baseline
+* 一个很轻的 residual L2
+
+我建议第一版权重就写得很保守：
+`L = 0.6 rank + 0.3 BCE + 0.2 anchor + 0.05 ||Δ||²`
+
+这里最关键的不是这几个系数本身，而是两件事：
+第一，**彻底删除 pixel loss**；
+第二，**checkpoint 不再按 train loss 选，而是按 support-holdout 的 image AUROC / rank proxy 选**。
+如果你还是按当前代码那样用训练损失早停，哪怕换成 image-only，也很容易继续把 support 过拟合成一个看起来 loss 更低、但 query 更差的模型。
+
+## 文本向量的地位
+
+现在因为你只做 image-level 分类，文本向量**比之前更值得保留为备选**，但我仍然不建议把它升成主线。
+
+更合理的做法是只做一个**frozen text prior** 小实验：
+
+* 冻结 CLIP text encoder
+* 不做 prompt tuning，不做 LoRA，不训 adapter
+* 只为每个 category 预先写一小组 normal / anomaly prompts
+* 计算一个 image-level `text_gap`
+* 把这个 `text_gap` 当成**额外 1–2 个标量特征**喂给 image residual gate
+
+也就是：文本只参与 **image gate / tie-breaker**，不参与 pixel，不生成 anomaly map，不改 retrieval。
+如果它有用，表现形式应该是：**在不破坏 `bottle` 的前提下，把 weak-five 的 image AUROC 再抬一点**。
+如果它没用，就可以很干净地把“文本先验不是当前瓶颈”这件事判掉。
+
+## 我现在会怎么排优先级
+
+第一，**先把当前 `P2` 整条分割式训练线停掉**。对你现在的任务，它已经不是“可选冗余”，而是**错目标**。
+第二，**重做 image-only residual calibrator**，并且显式把 `winner_image_score` 作为 frozen anchor 放进模型，而不是像当前 `P1` 那样只做 pooled feature fresh prediction。
+第三，**只保留一条文本备选**：frozen text prior 进 image gate；不做 prompt learning，不做 adapter，不做 LoRA。
+
+如果你问得更直接一点：
+**现在该不该引入文本向量？**
+我的答案是：
+
+**不该把它当主线。**
+**可以把它当唯一备选，但前提是你先把 Stage 3 改成纯 image-level 分类训练。**
+
+我会明确淘汰这三件事：
+
+* 当前 `dual-head + pixel loss` 主线
+* 任何继续围绕 `PRO / pixel AUROC / Dice` 的 Stage 3 gate
+* 现在就上 learnable prompt / adapter / LoRA 的文本路线
+
+如果你愿意，我下一条就直接按你这个“只做图像级异常识别”的新目标，把 **Stage 3 最小实验计划**重写成只有两条：`image-only 主线` 和 `text-prior 备选`。
+
+[1]: https://arxiv.org/abs/2404.05231?utm_source=chatgpt.com "PromptAD: Learning Prompts with only Normal Samples for Few-Shot Anomaly Detection"

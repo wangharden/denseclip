@@ -1,0 +1,171 @@
+请基于我当前项目的 **Stage 2 完整结果**，做一次**面向下一阶段（Stage 3，训练阶段）路线选择与实验设计**的技术分析。要求先解释 Stage 2 已经证明了什么、还没证明什么，再结合近年最相关工作，最后输出下一阶段的严格可执行训练计划。不要泛泛综述，要紧贴我当前代码、结果和硬件约束。
+
+## 一、项目背景
+
+* 任务：基于 DenseCLIP / CLIP visual backbone 做工业质检场景下的 few-shot anomaly detection
+* 数据：MVTec AD
+* 当前路线：Stage 2 已优先完成 frozen visual backbone + prototype / retrieval / structure enhancement 的视觉路线探索
+* 硬件约束：只有**单张 RTX 5060**
+* 当前阶段目标已经变化：Stage 2 的视觉路线已经基本跑清，**下一阶段直接进入训练型路线**；我现在需要决定训练什么、冻结什么、最小闭环怎么设计
+
+## 二、当前已知事实（这些不需要你重复总结，而是要据此做判断）
+
+### Stage 2 已完成的关键信息
+
+1. P0 已锁定默认 scorer：
+
+   * `A1 + layer4 + neg-normal + max + patch`
+
+2. P1 已证明单均值 prototype 是主瓶颈，视觉 baseline 收敛到：
+
+   * `A1 + memory_bank + support_normal_k=16 + reference_topk=3`
+
+3. P2 已证明在单类（尤其 hazelnut）上，唯一值得保留的结构增强分支是：
+
+   * `subspace(dim=8)`
+
+   但当时还不能直接扶正，因为单类下稳定性有疑问。
+
+4. P4 已扩到 MVTec 全 15 类，并完成 screening + finalist 三种子复评。
+
+   当前 full-15 visual finalist 已经明确为：
+
+   * `A1 + layer4 + neg-normal + max + patch + memory_bank + support_normal_k=16 + reference_topk=3 + subspace(dim=8)`
+
+5. P4 full-15 最终聚合结果：
+
+   * `image AUROC = 0.7020 +/- 0.1768`
+   * `pixel AUROC = 0.8697 +/- 0.1183`
+   * `PRO = 0.4921 +/- 0.1868`
+   * `balanced = 0.7858 +/- 0.1395`
+
+6. 当前 strongest classes：
+
+   * `bottle / toothbrush / transistor / pill / tile`
+
+7. 当前 weakest classes：
+
+   * `leather / grid / carpet / screw / zipper`
+
+### 当前真正需要判断的问题
+
+请不要再回到已经做过的大规模 scorer sweep，也不要泛泛建议“可以再多试几个参数”。  
+你需要直接判断：
+
+1. 既然下一阶段已经确定进入训练型路线，**最值得优先训练的对象是什么**：
+
+   * learned head / weakly supervised anomaly head
+   * prototype / retrieval 上的小型可学习模块
+   * parameter-efficient adaptation（prompt / adapter / LoRA）
+   * 还是别的更合适的低成本路线
+
+2. 应该固定哪些 Stage 2 视觉组件作为底座，哪些部分允许训练
+3. 最小训练闭环应先在弱类上做，还是直接做全 15 类
+
+## 三、希望你重点分析的技术问题
+
+请从技术和原理上分析以下问题，并按优先级排序：
+
+1. 现在 full-15 的主要瓶颈更像是：
+
+   * scoring 问题
+   * retrieval / matching 问题
+   * structure modeling 问题
+   * representation 问题
+   * 还是需要训练型方法才能继续突破
+
+2. 为什么 `subspace(dim=8)` 能在 full-15 上成为 winner，但弱类仍然明显存在？
+
+3. 当前 weakest classes 更可能意味着什么：
+
+   * 类别本身纹理/结构更难
+   * 当前 frozen visual representation 不够
+   * retrieval / subspace 的假设不成立
+   * 需要训练型判别头
+   * 需要轻量可学习 adaptation
+
+4. 在已经确定进入训练阶段的前提下，最合理的训练目标应该是：
+
+   * 提高 weak classes 的 image-level ranking
+   * 保住 pixel localization
+   * 同时不破坏当前 full-15 winner 的优势
+
+## 四、文献与技术调研要求
+
+请搜索并总结 **2022–2026** 与下面主题最相关、且对我当前阶段最可迁移的工作：
+
+1. few-shot anomaly detection / few-shot industrial anomaly detection
+2. weakly supervised anomaly detection / anomaly segmentation
+3. 基于 frozen visual backbone 的 anomaly head / lightweight trainable module
+4. prototype / memory bank / patch retrieval 上的可学习增强
+5. parameter-efficient adaptation（prompt / adapter / LoRA），但只作为候选，不要默认优先
+6. 适合单卡低成本训练、或只训练小模块的方案
+
+请重点回答：
+
+* 哪些方法最适合以当前 full-15 visual finalist 为固定底座继续做
+* 哪些方法明确适合 few-shot + MVTec 这类工业场景
+* 哪些方法更适合补弱类，而不是泛化地再做一轮统一调参
+* 哪些方法虽然论文效果强，但不适合我当前硬件和工程阶段
+
+## 五、输出形式要求
+
+请输出 5 个部分：
+
+### 1. Stage 2 结果诊断
+
+* 直接判断 Stage 2 到底已经证明了什么
+* 区分“视觉路线已经判清的部分”和“还没有判清的部分”
+* 解释为什么现在应该直接进入训练，以及训练问题应该怎样切分
+
+### 2. 相关工作归纳
+
+* 按主题分组，而不是只按时间线罗列
+* 每篇/每类方法说明：
+
+  * 核心思想
+  * 解决了什么问题
+  * 与我当前项目的相似点
+  * 可直接借鉴的技术点
+  * 对单卡 5060 是否现实
+
+### 3. 下一阶段训练路线判断
+
+请明确回答：
+
+* 在“已经进入训练阶段”的前提下，最值得优先尝试的是哪一条主线
+* 备选线是什么
+* 为什么训练主线应优先于继续扩大无训练视觉 sweep
+
+### 4. 最小可执行训练实验计划
+
+请给出一个**严格、可执行、按优先级排序**的计划，包括：
+
+* 实现顺序
+* 每一步目标
+* 需要修改的模块
+* 最小实验矩阵
+* 验收标准
+* 哪些先只做弱类（如 `leather / grid / carpet / screw / zipper`）
+* 哪些条件满足后再扩回全 15 类
+
+### 5. 路线决策建议
+
+请最后明确给出：
+
+* 如果你是我，下一轮最先做的 3 件事
+* 你推荐的唯一训练主线
+* 你保留的唯一备选线
+* 你明确不推荐现在投入的方向
+
+## 六、输出风格要求
+
+* 不要泛泛而谈
+* 不要重复总结我已经上传的 Stage 2 结果
+* 直接给路线判断
+* 给优先级
+* 给原因
+* 给执行顺序
+* 对涉及近年工作的结论给出处或引用依据
+* 如果某个判断是推断而不是文献明确结论，请明确写出“这是推断”
+* 默认以“低成本、单卡、最小闭环训练”为优先
