@@ -1,0 +1,24 @@
+{
+  "num_query_eval": 1665,
+  "num_resplits": 3,
+  "resplits": [
+    {
+      "split_index": 0,
+      "split_seed": 42,
+      "num_support_train": 150,
+      "num_support_holdout": 150
+    },
+    {
+      "split_index": 1,
+      "split_seed": 43,
+      "num_support_train": 150,
+      "num_support_holdout": 150
+    },
+    {
+      "split_index": 2,
+      "split_seed": 44,
+      "num_support_train": 150,
+      "num_support_holdout": 150
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+{
+  "mode": "screening",
+  "subset": "full15",
+  "output_dir": "C:\\Nottingham\\DenseCLIP-master\\outputs\\new-branch\\pure-visual\\full15\\seed44\\dinov2_patchcore_k1_last_v1",
+  "categories": [
+    "bottle",
+    "cable",
+    "capsule",
+    "carpet",
+    "grid",
+    "hazelnut",
+    "leather",
+    "metal_nut",
+    "pill",
+    "screw",
+    "tile",
+    "toothbrush",
+    "transistor",
+    "wood",
+    "zipper"
+  ],
+  "seeds": [
+    44
+  ],
+  "num_candidates": 1,
+  "candidates": [
+    {
+      "seed": 44,
+      "experiment": "dinov2_vits14_last_patchcore_knn_k001_core1000_topk010",
+      "config": {
+        "method": "patchcore_knn",
+        "feature_source": "last",
+        "knn_topk": 1,
+        "coreset_ratio": 1.0,
+        "topk_ratio": 0.01
+      }
+    }
+  ]
+}

@@ -18,6 +18,7 @@ from fewshot.cache import FeatureCacheSpec, collect_image_paths, load_feature_ca
 from fewshot.data import load_mask_array, load_shared_split_manifest, save_shared_split_manifest, stage_a1_split_from_manifest
 from fewshot.fastref import fastref_lite_normal_map
 from fewshot.feature_bank import PROTOTYPE_FAMILY_MEMORY_BANK, build_reference_bank, flatten_feature_map
+from fewshot.patchcore_subspace import coreset_subspace_score_map
 from fewshot.scoring import (
     AGGREGATION_MODE_MAX,
     AGGREGATION_MODES,
@@ -30,6 +31,7 @@ from fewshot.scoring import (
     score_map_outputs,
 )
 from fewshot.stage_a1 import binary_auroc, pixel_auroc
+from fewshot.retrieved_subspace import retrieved_subspace_score_map
 from fewshot.subspace import SUBSPACE_MODE_LOCAL, subspace_score_map
 
 
@@ -37,11 +39,15 @@ METHOD_BASELINE = "baseline"
 METHOD_FASTREF = "fastref_lite"
 METHOD_MATCHING = "matching"
 METHOD_SUBSPACE = "subspace"
+METHOD_RETRIEVED_SUBSPACE = "retrieved_subspace"
+METHOD_CORESET_SUBSPACE = "coreset_subspace"
 METHODS = (
     METHOD_BASELINE,
     METHOD_FASTREF,
     METHOD_MATCHING,
     METHOD_SUBSPACE,
+    METHOD_RETRIEVED_SUBSPACE,
+    METHOD_CORESET_SUBSPACE,
 )
 
 
@@ -64,6 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fastref-select-ratios", nargs="+", type=float, default=[0.1, 0.2])
     parser.add_argument("--fastref-blend-alphas", nargs="+", type=float, default=[0.25, 0.5])
     parser.add_argument("--fastref-steps", nargs="+", type=int, default=[1])
+    parser.add_argument("--coreset-ratios", nargs="+", type=float, default=[0.1, 0.25, 0.5])
     parser.add_argument("--match-ks", nargs="+", type=int, default=[1, 3])
     parser.add_argument("--spatial-windows", nargs="+", type=int, default=[0, 1])
     parser.add_argument("--subspace-dims", nargs="+", type=int, default=[16, 32, 64])
@@ -192,6 +199,28 @@ def iter_method_configs(args: argparse.Namespace) -> list[dict[str, object]]:
                         "subspace_dim": int(subspace_dim),
                     }
                 )
+        elif method == METHOD_RETRIEVED_SUBSPACE:
+            for match_k in args.match_ks:
+                for spatial_window in args.spatial_windows:
+                    for subspace_dim in args.subspace_dims:
+                        configs.append(
+                            {
+                                "method": method,
+                                "match_k": int(match_k),
+                                "spatial_window": int(spatial_window),
+                                "subspace_dim": int(subspace_dim),
+                            }
+                        )
+        elif method == METHOD_CORESET_SUBSPACE:
+            for coreset_ratio in args.coreset_ratios:
+                for subspace_dim in args.subspace_dims:
+                    configs.append(
+                        {
+                            "method": method,
+                            "coreset_ratio": float(coreset_ratio),
+                            "subspace_dim": int(subspace_dim),
+                        }
+                    )
     return configs
 
 
@@ -225,6 +254,21 @@ def build_run_name(args: argparse.Namespace, manifest, split, config: dict[str, 
         )
     elif config["method"] == METHOD_SUBSPACE:
         parts.append(f"dim{int(config['subspace_dim']):03d}")
+    elif config["method"] == METHOD_RETRIEVED_SUBSPACE:
+        parts.extend(
+            [
+                f"mk{int(config['match_k']):03d}",
+                f"win{int(config['spatial_window']):03d}",
+                f"dim{int(config['subspace_dim']):03d}",
+            ]
+        )
+    elif config["method"] == METHOD_CORESET_SUBSPACE:
+        parts.extend(
+            [
+                f"core{ratio_tag(float(config['coreset_ratio']))}",
+                f"dim{int(config['subspace_dim']):03d}",
+            ]
+        )
     return "_".join(parts)
 
 
@@ -406,6 +450,35 @@ def subspace_anomaly_map(
     )
 
 
+def retrieved_subspace_anomaly_map(
+    query_features: torch.Tensor,
+    support_feature_batch: torch.Tensor,
+    config: dict[str, object],
+) -> torch.Tensor:
+    return retrieved_subspace_score_map(
+        support_feature_batch=support_feature_batch,
+        query_feature_batch=query_features,
+        subspace_dim=int(config["subspace_dim"]),
+        retrieval_topk=int(config["match_k"]),
+        spatial_window=int(config["spatial_window"]),
+    )
+
+
+def coreset_subspace_anomaly_map(
+    query_features: torch.Tensor,
+    support_feature_batch: torch.Tensor,
+    config: dict[str, object],
+    seed: int,
+) -> torch.Tensor:
+    return coreset_subspace_score_map(
+        support_feature_batch=support_feature_batch,
+        query_feature_batch=query_features,
+        subspace_dim=int(config["subspace_dim"]),
+        coreset_ratio=float(config["coreset_ratio"]),
+        seed=int(seed),
+    )
+
+
 def run_method(
     args: argparse.Namespace,
     split,
@@ -423,6 +496,10 @@ def run_method(
         return matching_anomaly_map(query_features, support_feature_batch, config)
     if method == METHOD_SUBSPACE:
         return subspace_anomaly_map(query_features, support_feature_batch, config)
+    if method == METHOD_RETRIEVED_SUBSPACE:
+        return retrieved_subspace_anomaly_map(query_features, support_feature_batch, config)
+    if method == METHOD_CORESET_SUBSPACE:
+        return coreset_subspace_anomaly_map(query_features, support_feature_batch, config, seed=args.seed)
     raise ValueError(f"Unsupported method: {method}")
 
 

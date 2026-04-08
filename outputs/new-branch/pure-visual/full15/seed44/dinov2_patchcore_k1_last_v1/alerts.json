@@ -1,0 +1,7 @@
+[
+  {
+    "experiment": "dinov2_vits14_last_patchcore_knn_k001_core1000_topk010",
+    "seed": 44,
+    "alerts": []
+  }
+]

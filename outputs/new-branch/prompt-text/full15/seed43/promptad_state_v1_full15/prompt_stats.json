@@ -1,0 +1,165 @@
+{
+  "bottle": {
+    "num_normal_prompts": 4,
+    "num_anomaly_prompts": 4,
+    "num_state_prompts": 12,
+    "num_specific_defect_types": 3,
+    "specific_defect_types": [
+      "broken_large",
+      "broken_small",
+      "contamination"
+    ]
+  },
+  "cable": {
+    "num_normal_prompts": 4,
+    "num_anomaly_prompts": 4,
+    "num_state_prompts": 12,
+    "num_specific_defect_types": 2,
+    "specific_defect_types": [
+      "bent_wire",
+      "cut_inner_insulation"
+    ]
+  },
+  "capsule": {
+    "num_normal_prompts": 4,
+    "num_anomaly_prompts": 4,
+    "num_state_prompts": 12,
+    "num_specific_defect_types": 3,
+    "specific_defect_types": [
+      "crack",
+      "faulty_imprint",
+      "squeeze"
+    ]
+  },
+  "carpet": {
+    "num_normal_prompts": 4,
+    "num_anomaly_prompts": 4,
+    "num_state_prompts": 12,
+    "num_specific_defect_types": 2,
+    "specific_defect_types": [
+      "color",
+      "thread"
+    ]
+  },
+  "grid": {
+    "num_normal_prompts": 4,
+    "num_anomaly_prompts": 4,
+    "num_state_prompts": 12,
+    "num_specific_defect_types": 3,
+    "specific_defect_types": [
+      "bent",
+      "metal_contamination",
+      "thread"
+    ]
+  },
+  "hazelnut": {
+    "num_normal_prompts": 4,
+    "num_anomaly_prompts": 4,
+    "num_state_prompts": 12,
+    "num_specific_defect_types": 3,
+    "specific_defect_types": [
+      "cut",
+      "hole",
+      "print"
+    ]
+  },
+  "leather": {
+    "num_normal_prompts": 4,
+    "num_anomaly_prompts": 4,
+    "num_state_prompts": 12,
+    "num_specific_defect_types": 3,
+    "specific_defect_types": [
+      "color",
+      "glue",
+      "poke"
+    ]
+  },
+  "metal_nut": {
+    "num_normal_prompts": 4,
+    "num_anomaly_prompts": 4,
+    "num_state_prompts": 12,
+    "num_specific_defect_types": 3,
+    "specific_defect_types": [
+      "bent",
+      "color",
+      "flip"
+    ]
+  },
+  "pill": {
+    "num_normal_prompts": 4,
+    "num_anomaly_prompts": 4,
+    "num_state_prompts": 12,
+    "num_specific_defect_types": 3,
+    "specific_defect_types": [
+      "color",
+      "combined",
+      "crack"
+    ]
+  },
+  "screw": {
+    "num_normal_prompts": 4,
+    "num_anomaly_prompts": 4,
+    "num_state_prompts": 12,
+    "num_specific_defect_types": 4,
+    "specific_defect_types": [
+      "scratch_head",
+      "scratch_neck",
+      "thread_side",
+      "thread_top"
+    ]
+  },
+  "tile": {
+    "num_normal_prompts": 4,
+    "num_anomaly_prompts": 4,
+    "num_state_prompts": 12,
+    "num_specific_defect_types": 2,
+    "specific_defect_types": [
+      "crack",
+      "gray_stroke"
+    ]
+  },
+  "toothbrush": {
+    "num_normal_prompts": 4,
+    "num_anomaly_prompts": 4,
+    "num_state_prompts": 12,
+    "num_specific_defect_types": 1,
+    "specific_defect_types": [
+      "defective"
+    ]
+  },
+  "transistor": {
+    "num_normal_prompts": 4,
+    "num_anomaly_prompts": 4,
+    "num_state_prompts": 12,
+    "num_specific_defect_types": 4,
+    "specific_defect_types": [
+      "bent_lead",
+      "cut_lead",
+      "damaged_case",
+      "misplaced"
+    ]
+  },
+  "wood": {
+    "num_normal_prompts": 4,
+    "num_anomaly_prompts": 4,
+    "num_state_prompts": 12,
+    "num_specific_defect_types": 3,
+    "specific_defect_types": [
+      "combined",
+      "hole",
+      "scratch"
+    ]
+  },
+  "zipper": {
+    "num_normal_prompts": 4,
+    "num_anomaly_prompts": 4,
+    "num_state_prompts": 12,
+    "num_specific_defect_types": 4,
+    "specific_defect_types": [
+      "broken_teeth",
+      "combined",
+      "fabric_border",
+      "split_teeth"
+    ]
+  }
+}

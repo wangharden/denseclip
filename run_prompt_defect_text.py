@@ -1,8 +1,11 @@
 import argparse
+import importlib.util
 import json
+import os
 import random
 import sys
 import types
+import warnings
 from collections import defaultdict
 from pathlib import Path
 
@@ -21,10 +24,20 @@ TOKENIZER_ROOT = REPO_ROOT / "detection" / "denseclip"
 if str(TOKENIZER_ROOT) not in sys.path:
     sys.path.insert(0, str(TOKENIZER_ROOT))
 
-if "ftfy" not in sys.modules:
+if importlib.util.find_spec("ftfy") is None:
+    if os.environ.get("DENSECLIP_ALLOW_MISSING_FTFY", "").strip().lower() not in {"1", "true", "yes"}:
+        raise RuntimeError(
+            "ftfy is required for prompt-text experiments. Install `ftfy` or set "
+            "`DENSECLIP_ALLOW_MISSING_FTFY=1` to run in explicit degraded mode."
+        )
     ftfy_stub = types.ModuleType("ftfy")
     ftfy_stub.fix_text = lambda text: text
     sys.modules["ftfy"] = ftfy_stub
+    warnings.warn(
+        "ftfy is unavailable; prompt-text token cleanup is running in explicit degraded mode.",
+        RuntimeWarning,
+        stacklevel=1,
+    )
 
 from untils import tokenize
 
@@ -62,6 +75,7 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         default="outputs/new-branch/prompt-text/weak5_bottle/seed42/prompt_p_v2_multisplit_visual",
     )
+    parser.add_argument("--scope", default="")
     parser.add_argument("--clip-image-size", type=int, default=224)
     parser.add_argument("--denseclip-image-size", type=int, default=320)
     parser.add_argument("--batch-size", type=int, default=16)
@@ -289,13 +303,32 @@ def average_precision_score(labels: list[int], scores: list[float]) -> float:
 def choose_threshold(labels: list[int], scores: list[float]) -> dict[str, float]:
     values = sorted({float(score) for score in scores})
     if not values:
-        return {"threshold": 0.0, "f1": 0.0}
+        return {"threshold": 0.0, "balanced_accuracy": 0.0, "f1": 0.0}
     candidates = [values[0] - 1e-6]
     candidates.extend(values)
-    best = {"threshold": candidates[0], "f1": -1.0, "precision": 0.0, "recall": 0.0, "accuracy": 0.0}
+    best = {
+        "threshold": candidates[0],
+        "balanced_accuracy": -1.0,
+        "f1": -1.0,
+        "precision": 0.0,
+        "recall": 0.0,
+        "accuracy": 0.0,
+        "specificity": 0.0,
+    }
     for threshold in candidates:
         metrics = classification_metrics(labels=labels, scores=scores, threshold=float(threshold))
-        if metrics["f1"] > best["f1"] + 1e-12:
+        if (
+            metrics["balanced_accuracy"] > best["balanced_accuracy"] + 1e-12
+            or (
+                abs(metrics["balanced_accuracy"] - best["balanced_accuracy"]) <= 1e-12
+                and metrics["f1"] > best["f1"] + 1e-12
+            )
+            or (
+                abs(metrics["balanced_accuracy"] - best["balanced_accuracy"]) <= 1e-12
+                and abs(metrics["f1"] - best["f1"]) <= 1e-12
+                and metrics["accuracy"] > best["accuracy"] + 1e-12
+            )
+        ):
             best = {"threshold": float(threshold), **metrics}
     return best
 
@@ -310,12 +343,70 @@ def classification_metrics(labels: list[int], scores: list[float], threshold: fl
     fn = int(np.sum((preds == 0) & (labels_array == 1)))
     precision = tp / max(1, tp + fp)
     recall = tp / max(1, tp + fn)
+    specificity = tn / max(1, tn + fp)
+    balanced_accuracy = 0.5 * (recall + specificity)
     accuracy = (tp + tn) / max(1, labels_array.size)
     f1 = 0.0 if precision + recall <= 0.0 else (2.0 * precision * recall) / (precision + recall)
     return {
         "accuracy": float(accuracy),
         "precision": float(precision),
         "recall": float(recall),
+        "specificity": float(specificity),
+        "balanced_accuracy": float(balanced_accuracy),
+        "f1": float(f1),
+        "tp": float(tp),
+        "tn": float(tn),
+        "fp": float(fp),
+        "fn": float(fn),
+    }
+
+
+def choose_thresholds_by_category(
+    records: list[dict[str, object]],
+    scores: list[float],
+) -> dict[str, dict[str, float]]:
+    grouped: dict[str, dict[str, list[float]]] = defaultdict(lambda: {"labels": [], "scores": []})
+    for record, score in zip(records, scores, strict=True):
+        category = str(record["category"])
+        grouped[category]["labels"].append(int(record["label"]))
+        grouped[category]["scores"].append(float(score))
+    threshold_map: dict[str, dict[str, float]] = {}
+    for category, payload in sorted(grouped.items()):
+        threshold_map[category] = choose_threshold(payload["labels"], payload["scores"])
+    return threshold_map
+
+
+def prediction_array(
+    records: list[dict[str, object]],
+    scores: list[float],
+    threshold_map: dict[str, dict[str, float]],
+) -> np.ndarray:
+    preds: list[int] = []
+    for record, score in zip(records, scores, strict=True):
+        category = str(record["category"])
+        threshold = float(threshold_map[category]["threshold"])
+        preds.append(int(float(score) >= threshold))
+    return np.asarray(preds, dtype=np.int64)
+
+
+def classification_metrics_from_preds(labels: list[int], preds: np.ndarray) -> dict[str, float]:
+    labels_array = np.asarray(labels, dtype=np.int64)
+    tp = int(np.sum((preds == 1) & (labels_array == 1)))
+    tn = int(np.sum((preds == 0) & (labels_array == 0)))
+    fp = int(np.sum((preds == 1) & (labels_array == 0)))
+    fn = int(np.sum((preds == 0) & (labels_array == 1)))
+    precision = tp / max(1, tp + fp)
+    recall = tp / max(1, tp + fn)
+    specificity = tn / max(1, tn + fp)
+    balanced_accuracy = 0.5 * (recall + specificity)
+    accuracy = (tp + tn) / max(1, labels_array.size)
+    f1 = 0.0 if precision + recall <= 0.0 else (2.0 * precision * recall) / (precision + recall)
+    return {
+        "accuracy": float(accuracy),
+        "precision": float(precision),
+        "recall": float(recall),
+        "specificity": float(specificity),
+        "balanced_accuracy": float(balanced_accuracy),
         "f1": float(f1),
         "tp": float(tp),
         "tn": float(tn),
@@ -358,7 +449,7 @@ def compute_score_batch(
 def evaluate_rows(
     records: list[dict[str, object]],
     scores: list[float],
-    threshold: float,
+    threshold_map: dict[str, dict[str, float]],
 ) -> tuple[list[dict[str, object]], dict[str, float]]:
     grouped: dict[str, list[tuple[int, float]]] = defaultdict(list)
     for record, score in zip(records, scores, strict=True):
@@ -368,6 +459,7 @@ def evaluate_rows(
     for category, items in sorted(grouped.items()):
         labels = [label for label, _ in items]
         category_scores = [score for _, score in items]
+        threshold = float(threshold_map[category]["threshold"])
         cls_metrics = classification_metrics(labels=labels, scores=category_scores, threshold=threshold)
         per_category_rows.append(
             {
@@ -380,22 +472,34 @@ def evaluate_rows(
                 "accuracy": cls_metrics["accuracy"],
                 "precision": cls_metrics["precision"],
                 "recall": cls_metrics["recall"],
+                "specificity": cls_metrics["specificity"],
+                "balanced_accuracy": cls_metrics["balanced_accuracy"],
                 "f1": cls_metrics["f1"],
+                "num_pred_positive": int(cls_metrics["tp"] + cls_metrics["fp"]),
+                "num_pred_negative": int(cls_metrics["tn"] + cls_metrics["fn"]),
+                "threshold": threshold,
             }
         )
 
     labels = [int(record["label"]) for record in records]
-    global_cls = classification_metrics(labels=labels, scores=scores, threshold=threshold)
+    global_preds = prediction_array(records=records, scores=scores, threshold_map=threshold_map)
+    global_cls = classification_metrics_from_preds(labels=labels, preds=global_preds)
     weak_rows = [row for row in per_category_rows if row["category"] != CONTROL_CATEGORY]
     bottle_row = next(row for row in per_category_rows if row["category"] == CONTROL_CATEGORY)
     aggregate = {
         "num_test_images": len(records),
+        "num_query_normal": int(sum(label == 0 for label in labels)),
+        "num_query_defect": int(sum(label == 1 for label in labels)),
         "image_auroc_mean": float(np.mean([row["image_auroc"] for row in per_category_rows])),
         "image_ap_mean": float(np.mean([row["image_ap"] for row in per_category_rows])),
         "accuracy": global_cls["accuracy"],
         "precision": global_cls["precision"],
         "recall": global_cls["recall"],
+        "specificity": global_cls["specificity"],
+        "balanced_accuracy": global_cls["balanced_accuracy"],
         "f1": global_cls["f1"],
+        "num_pred_positive": int(global_cls["tp"] + global_cls["fp"]),
+        "num_pred_negative": int(global_cls["tn"] + global_cls["fn"]),
         "weak5_image_auroc_mean": float(np.mean([row["image_auroc"] for row in weak_rows])),
         "weak5_image_ap_mean": float(np.mean([row["image_ap"] for row in weak_rows])),
         "bottle_image_auroc": float(bottle_row["image_auroc"]),
@@ -408,7 +512,7 @@ def write_summary(path: Path, experiments_rows: list[dict[str, object]]) -> None
     for row in experiments_rows:
         lines.append(
             f"{row['experiment']}: auroc={row['image_auroc_mean']:.6f} ap={row['image_ap_mean']:.6f} "
-            f"acc={row['accuracy']:.6f} f1={row['f1']:.6f}"
+            f"acc={row['accuracy']:.6f} bal_acc={row['balanced_accuracy']:.6f} f1={row['f1']:.6f}"
         )
     if len(experiments_rows) >= 2:
         base = experiments_rows[0]
@@ -442,15 +546,17 @@ def build_predictions_rows(
     records: list[dict[str, object]],
     scores: list[float],
     details: list[dict[str, object]],
-    threshold: float,
+    threshold_map: dict[str, dict[str, float]],
 ) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for record, score, detail in zip(records, scores, details, strict=True):
+        category = str(record["category"])
+        threshold = float(threshold_map[category]["threshold"])
         rows.append(
             {
                 "experiment": experiment,
                 "path": str(record["path"]),
-                "category": str(record["category"]),
+                "category": category,
                 "defect_type": str(record.get("defect_type") or ""),
                 "label": int(record["label"]),
                 "score": float(score),
@@ -476,19 +582,20 @@ def append_result_rows(
     predictions: list[dict[str, object]],
     selection_source: str,
     threshold_source: str,
-    threshold_value: float,
+    threshold_value: object,
+    scope: str,
     selection_epoch: str = "",
 ) -> None:
     row = {
         "experiment": experiment_name,
         "track": "prompt-text",
-        "scope": "weak5_bottle",
+        "scope": scope,
         "seed": seed,
         "num_categories": len(per_category),
         **aggregate,
         "selection_source": selection_source,
         "threshold_source": threshold_source,
-        "threshold_value": float(threshold_value),
+        "threshold_value": threshold_value,
     }
     if selection_epoch:
         row["selection_epoch"] = selection_epoch
@@ -563,11 +670,11 @@ def train_split_model(
             p_vector=p_vector,
         )
         holdout_scores = holdout_scores_tensor.detach().cpu().tolist()
-        holdout_threshold = choose_threshold(labels=holdout_labels, scores=holdout_scores)["threshold"]
+        holdout_threshold_map = choose_thresholds_by_category(records=holdout_records, scores=holdout_scores)
         _, holdout_aggregate = evaluate_rows(
             records=holdout_records,
             scores=holdout_scores,
-            threshold=float(holdout_threshold),
+            threshold_map=holdout_threshold_map,
         )
         holdout_metric = float(holdout_aggregate["image_auroc_mean"])
         metric_row = {
@@ -622,6 +729,7 @@ def main() -> None:
     cache_dir = Path(args.cache_dir)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    scope = args.scope.strip() or cache_dir.parent.name or cache_dir.name
 
     feature_sources = parse_feature_sources(args.feature_sources)
     records, _ = load_records(cache_dir)
@@ -669,6 +777,7 @@ def main() -> None:
 
     config = {
         "track": "new-branch/prompt-text",
+        "scope": scope,
         "cache_dir": str(cache_dir),
         "pretrained": args.pretrained,
         "output_dir": str(output_dir),
@@ -685,7 +794,7 @@ def main() -> None:
         "p_l2": args.p_l2,
         "score_contract": "max_defect_similarity - max_normal_similarity",
         "visual_side": "frozen",
-        "selection_contract": "per_split_best_epoch + pooled_holdout_threshold + averaged_query_logits",
+        "selection_contract": "per_split_best_epoch + per_category_pooled_holdout_threshold + averaged_query_logits",
     }
     (output_dir / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
 
@@ -734,19 +843,19 @@ def main() -> None:
         holdout = resplit["holdout"]
         pooled_holdout_baseline_scores.extend(float(record["winner_image_score"]) for record in holdout)
         pooled_holdout_baseline_labels.extend(int(record["label"]) for record in holdout)
-    baseline_threshold_info = choose_threshold(
-        labels=pooled_holdout_baseline_labels,
-        scores=pooled_holdout_baseline_scores,
-    )
-    baseline_threshold = float(baseline_threshold_info["threshold"])
     baseline_scores = [float(record["winner_image_score"]) for record in eval_records]
-    e0_per_category, e0_aggregate = evaluate_rows(records=eval_records, scores=baseline_scores, threshold=baseline_threshold)
+    baseline_threshold_map = choose_thresholds_by_category(records=sum([resplit["holdout"] for resplit in resplits], []), scores=pooled_holdout_baseline_scores)
+    e0_per_category, e0_aggregate = evaluate_rows(
+        records=eval_records,
+        scores=baseline_scores,
+        threshold_map=baseline_threshold_map,
+    )
     e0_predictions = build_predictions_rows(
         experiment="E0",
         records=eval_records,
         scores=baseline_scores,
         details=[{} for _ in eval_records],
-        threshold=baseline_threshold,
+        threshold_map=baseline_threshold_map,
     )
     append_result_rows(
         experiments_rows=experiments_rows,
@@ -758,13 +867,17 @@ def main() -> None:
         per_category=e0_per_category,
         predictions=e0_predictions,
         selection_source="frozen_stage2_winner",
-        threshold_source="pooled_multisplit_holdout_best_f1",
-        threshold_value=baseline_threshold,
+        threshold_source="per_category_pooled_multisplit_holdout_best_balanced_accuracy",
+        threshold_value="per_category",
+        scope=scope,
     )
 
     resplit_history: dict[str, object] = {
-        "threshold_pooling": "pooled_multisplit_holdout_best_f1",
+        "threshold_pooling": "per_category_pooled_multisplit_holdout_best_balanced_accuracy",
         "feature_sources": {},
+    }
+    threshold_report: dict[str, object] = {
+        "E0": baseline_threshold_map,
     }
 
     for source_name in feature_sources:
@@ -799,20 +912,21 @@ def main() -> None:
                     "holdout_image_auroc_mean": binary_auroc(holdout_labels, holdout_scores),
                 }
             )
-        frozen_threshold = float(
-            choose_threshold(labels=pooled_frozen_holdout_labels, scores=pooled_frozen_holdout_scores)["threshold"]
+        frozen_threshold_map = choose_thresholds_by_category(
+            records=sum([resplit["holdout"] for resplit in resplits], []),
+            scores=pooled_frozen_holdout_scores,
         )
         frozen_per_category, frozen_aggregate = evaluate_rows(
             records=eval_records,
             scores=frozen_eval_scores,
-            threshold=frozen_threshold,
+            threshold_map=frozen_threshold_map,
         )
         frozen_predictions = build_predictions_rows(
             experiment=f"prompt_only_frozen__{source_name}",
             records=eval_records,
             scores=frozen_eval_scores,
             details=frozen_eval_details,
-            threshold=frozen_threshold,
+            threshold_map=frozen_threshold_map,
         )
         append_result_rows(
             experiments_rows=experiments_rows,
@@ -824,9 +938,11 @@ def main() -> None:
             per_category=frozen_per_category,
             predictions=frozen_predictions,
             selection_source="frozen_prompt_bank",
-            threshold_source="pooled_multisplit_holdout_best_f1",
-            threshold_value=frozen_threshold,
+            threshold_source="per_category_pooled_multisplit_holdout_best_balanced_accuracy",
+            threshold_value="per_category",
+            scope=scope,
         )
+        threshold_report[f"prompt_only_frozen__{source_name}"] = frozen_threshold_map
 
         split_eval_scores: list[list[float]] = []
         split_eval_details: list[list[dict[str, object]]] = []
@@ -892,22 +1008,23 @@ def main() -> None:
                 }
             )
 
-        plus_threshold = float(
-            choose_threshold(labels=pooled_plus_holdout_labels, scores=pooled_plus_holdout_scores)["threshold"]
+        plus_threshold_map = choose_thresholds_by_category(
+            records=sum([resplit["holdout"] for resplit in resplits], []),
+            scores=pooled_plus_holdout_scores,
         )
         plus_eval_scores = mean_score_lists(split_eval_scores)
         representative_details = split_eval_details[0] if split_eval_details else [{} for _ in eval_records]
         plus_per_category, plus_aggregate = evaluate_rows(
             records=eval_records,
             scores=plus_eval_scores,
-            threshold=plus_threshold,
+            threshold_map=plus_threshold_map,
         )
         plus_predictions = build_predictions_rows(
             experiment=f"prompt_plus_p__{source_name}",
             records=eval_records,
             scores=plus_eval_scores,
             details=representative_details,
-            threshold=plus_threshold,
+            threshold_map=plus_threshold_map,
         )
         append_result_rows(
             experiments_rows=experiments_rows,
@@ -919,13 +1036,16 @@ def main() -> None:
             per_category=plus_per_category,
             predictions=plus_predictions,
             selection_source="multisplit_holdout_image_auroc_mean",
-            threshold_source="pooled_multisplit_holdout_best_f1",
-            threshold_value=plus_threshold,
+            threshold_source="per_category_pooled_multisplit_holdout_best_balanced_accuracy",
+            threshold_value="per_category",
+            scope=scope,
             selection_epoch=",".join(selection_epochs),
         )
         resplit_history["feature_sources"][source_name] = feature_history
+        threshold_report[f"prompt_plus_p__{source_name}"] = plus_threshold_map
 
     (output_dir / "resplit_history.json").write_text(json.dumps(resplit_history, indent=2), encoding="utf-8")
+    (output_dir / "threshold_report.json").write_text(json.dumps(threshold_report, indent=2), encoding="utf-8")
     write_csv(output_dir / "experiments.csv", experiments_rows)
     write_csv(output_dir / "per_category.csv", per_category_rows)
     write_csv(output_dir / "predictions.csv", predictions_rows)

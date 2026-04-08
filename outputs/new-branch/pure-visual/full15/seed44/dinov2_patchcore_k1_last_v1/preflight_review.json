@@ -1,0 +1,32 @@
+{
+  "route": "pure-visual-dinov2",
+  "mode": "screening",
+  "subset": "full15",
+  "seeds": [
+    44
+  ],
+  "categories": [
+    "bottle",
+    "cable",
+    "capsule",
+    "carpet",
+    "grid",
+    "hazelnut",
+    "leather",
+    "metal_nut",
+    "pill",
+    "screw",
+    "tile",
+    "toothbrush",
+    "transistor",
+    "wood",
+    "zipper"
+  ],
+  "backbone": "dinov2_vits14",
+  "risks": [
+    "DINOv2 patch memory is substantially larger than the old CLIP cache.",
+    "Support-defect is used only for threshold calibration, not feature fitting.",
+    "Coreset ratios are intentionally small for runtime safety on dense DINO patches."
+  ],
+  "go": true
+}

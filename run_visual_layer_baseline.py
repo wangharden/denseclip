@@ -124,6 +124,7 @@ def build_reference_payloads(
     support_train: list[dict[str, object]],
     encoded_by_path: dict[str, dict[str, torch.Tensor]],
     reference_topk: int,
+    seed: int,
 ) -> dict[str, dict[str, torch.Tensor | int]]:
     grouped: dict[str, dict[str, list[torch.Tensor]]] = defaultdict(lambda: defaultdict(list))
     for record in support_train:
@@ -144,14 +145,14 @@ def build_reference_payloads(
                 features=flatten_feature_map(normal_layer3),
                 prototype_family="memory_bank",
                 num_prototypes=1,
-                seed=42,
+                seed=seed,
                 num_iters=1,
             ).contiguous(),
             "layer3_defect_ref": build_reference_bank(
                 features=flatten_feature_map(defect_layer3),
                 prototype_family="memory_bank",
                 num_prototypes=1,
-                seed=43,
+                seed=seed + 1,
                 num_iters=1,
             ).contiguous(),
             "global_normal_ref": F.normalize(normal_global.mean(dim=0, keepdim=True), dim=1)[0].contiguous(),
@@ -316,7 +317,7 @@ def summarize_experiment(
         "weak5_image_auroc_mean": float(np.mean([float(row["image_auroc"]) for row in weak_rows])),
         "weak5_image_ap_mean": float(np.mean([float(row["image_ap"]) for row in weak_rows])),
         "bottle_image_auroc": float(bottle_row["image_auroc"]),
-        "selection_source": "frozen_fixed_control_vs_candidate",
+        "selection_source": "parallel_control_candidate_eval",
         "threshold_source": "holdout_max_f1",
         "threshold": float(threshold_info["threshold"]),
     }
@@ -414,6 +415,7 @@ def main() -> None:
         support_train=support_train,
         encoded_by_path=encoded_by_path,
         reference_topk=args.reference_topk,
+        seed=args.seed,
     )
 
     experiments_rows: list[dict[str, object]] = []
@@ -497,7 +499,7 @@ def main() -> None:
         "experiments": [EXPERIMENT_LAYER4_GLOBAL, EXPERIMENT_LAYER3_GAP],
         "control_experiment": EXPERIMENT_LAYER4_GLOBAL,
         "candidate_experiment": EXPERIMENT_LAYER3_GAP,
-        "selection_source": "frozen_fixed_control_vs_candidate",
+        "selection_source": "parallel_control_candidate_eval",
         "threshold_source": "holdout_max_f1",
     }
 

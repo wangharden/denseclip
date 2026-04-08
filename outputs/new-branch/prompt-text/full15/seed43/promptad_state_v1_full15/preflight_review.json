@@ -1,0 +1,12 @@
+{
+  "route": "prompt-text-continuation",
+  "variant": "promptad_state_v1",
+  "go": true,
+  "official_scope": "full15",
+  "official_output_dir": "outputs\\new-branch\\prompt-text\\full15\\seed43\\promptad_state_v1_full15",
+  "risks": [
+    "This branch is PromptAD-like and category-specific; it does not reuse the failed shared-context v2/v3/v4 family.",
+    "Prompt banks are built from support taxonomy only; checker must still verify bottle and zipper do not collapse.",
+    "weak5 is screening only and cannot trigger official stage-doc writeback."
+  ]
+}
