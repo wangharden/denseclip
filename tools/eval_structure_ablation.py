@@ -353,46 +353,99 @@ def connected_component_masks(mask: np.ndarray) -> list[np.ndarray]:
     return [(labeled == label_id) for label_id in range(1, num + 1)]
 
 
+def trapezoid(x: np.ndarray, y: np.ndarray, x_max: float | None = None) -> float:
+    x = np.asarray(x)
+    y = np.asarray(y)
+    finite_mask = np.logical_and(np.isfinite(x), np.isfinite(y))
+    x = x[finite_mask]
+    y = y[finite_mask]
+    correction = 0.0
+    if x_max is not None:
+        if x_max not in x:
+            ins = int(np.searchsorted(x, x_max))
+            if 0 < ins < len(x):
+                y_interp = y[ins - 1] + ((y[ins] - y[ins - 1]) * (x_max - x[ins - 1]) / (x[ins] - x[ins - 1]))
+                correction = 0.5 * (y_interp + y[ins - 1]) * (x_max - x[ins - 1])
+        mask = x <= x_max
+        x = x[mask]
+        y = y[mask]
+    if len(x) < 2:
+        return float("nan")
+    return float(np.sum(0.5 * (y[1:] + y[:-1]) * (x[1:] - x[:-1])) + correction)
+
+
 def pro_score(
     mask_arrays: list[np.ndarray],
     score_maps: list[np.ndarray],
     max_fpr: float = 0.3,
-    num_thresholds: int = 200,
 ) -> float:
     if not mask_arrays or not score_maps:
         return float("nan")
-    all_scores = np.concatenate([score.reshape(-1) for score in score_maps], axis=0)
-    negative_scores = np.concatenate(
-        [score[mask <= 0.5].reshape(-1) for mask, score in zip(mask_arrays, score_maps)],
-        axis=0,
-    )
-    regions = [connected_component_masks(mask) for mask in mask_arrays]
-    num_regions = sum(len(items) for items in regions)
-    if num_regions == 0 or negative_scores.size == 0:
+
+    structure = np.ones((3, 3), dtype=int)
+    num_ok_pixels = 0
+    num_gt_regions = 0
+
+    shape = (len(score_maps), score_maps[0].shape[0], score_maps[0].shape[1])
+    fp_changes = np.zeros(shape, dtype=np.uint32)
+    pro_changes = np.zeros(shape, dtype=np.float64)
+
+    for gt_ind, gt_map in enumerate(mask_arrays):
+        labeled, n_components = ndimage.label(gt_map > 0.5, structure)
+        num_gt_regions += n_components
+
+        ok_mask = labeled == 0
+        num_ok_pixels += int(np.sum(ok_mask))
+
+        fp_change = np.zeros_like(gt_map, dtype=fp_changes.dtype)
+        fp_change[ok_mask] = 1
+
+        pro_change = np.zeros_like(gt_map, dtype=np.float64)
+        for k in range(n_components):
+            region_mask = labeled == (k + 1)
+            region_size = int(np.sum(region_mask))
+            if region_size > 0:
+                pro_change[region_mask] = 1.0 / float(region_size)
+
+        fp_changes[gt_ind, :, :] = fp_change
+        pro_changes[gt_ind, :, :] = pro_change
+
+    if num_ok_pixels <= 0 or num_gt_regions <= 0:
         return float("nan")
 
-    thresholds = np.linspace(float(all_scores.max()), float(all_scores.min()), num_thresholds)
-    fprs: list[float] = []
-    pros: list[float] = []
-    for threshold in thresholds:
-        fpr = float((negative_scores >= threshold).mean())
-        if fpr > max_fpr:
-            continue
-        overlaps: list[float] = []
-        for region_set, score_map in zip(regions, score_maps):
-            pred = score_map >= threshold
-            for region_mask in region_set:
-                overlaps.append(float(pred[region_mask].mean()))
-        if overlaps:
-            fprs.append(fpr)
-            pros.append(float(np.mean(overlaps)))
+    anomaly_scores_flat = np.array(score_maps).ravel()
+    fp_changes_flat = fp_changes.ravel()
+    pro_changes_flat = pro_changes.ravel()
 
-    if len(fprs) < 2:
-        return float("nan")
-    order = np.argsort(fprs)
-    normalized_fpr = np.asarray(fprs, dtype=np.float64)[order] / max_fpr
-    pro_values = np.asarray(pros, dtype=np.float64)[order]
-    return float(np.trapezoid(pro_values, normalized_fpr))
+    sort_idxs = np.argsort(anomaly_scores_flat).astype(np.uint32)[::-1]
+    np.take(anomaly_scores_flat, sort_idxs, out=anomaly_scores_flat)
+    anomaly_scores_sorted = anomaly_scores_flat
+    np.take(fp_changes_flat, sort_idxs, out=fp_changes_flat)
+    fp_changes_sorted = fp_changes_flat
+    np.take(pro_changes_flat, sort_idxs, out=pro_changes_flat)
+    pro_changes_sorted = pro_changes_flat
+
+    np.cumsum(fp_changes_sorted, out=fp_changes_sorted)
+    fp_changes_sorted = fp_changes_sorted.astype(np.float32, copy=False)
+    np.divide(fp_changes_sorted, num_ok_pixels, out=fp_changes_sorted)
+    fprs = fp_changes_sorted
+
+    np.cumsum(pro_changes_sorted, out=pro_changes_sorted)
+    np.divide(pro_changes_sorted, num_gt_regions, out=pro_changes_sorted)
+    pros = pro_changes_sorted
+
+    keep_mask = np.append(np.diff(anomaly_scores_sorted) != 0, np.True_)
+    fprs = fprs[keep_mask]
+    pros = pros[keep_mask]
+    np.clip(fprs, a_min=None, a_max=1.0, out=fprs)
+    np.clip(pros, a_min=None, a_max=1.0, out=pros)
+
+    zero = np.array([0.0])
+    one = np.array([1.0])
+    fprs = np.concatenate((zero, fprs, one))
+    pros = np.concatenate((zero, pros, one))
+
+    return float(trapezoid(fprs, pros, x_max=max_fpr) / max_fpr)
 
 
 def baseline_anomaly_map(query_features: torch.Tensor, normal_bank: torch.Tensor, reference_topk: int) -> torch.Tensor:

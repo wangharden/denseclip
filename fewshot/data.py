@@ -13,7 +13,13 @@ from torch.utils.data import Dataset
 VALID_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
 CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
-_SUPPORT_TENSOR_CACHE: dict[tuple[str, int], torch.Tensor] = {}
+_SUPPORT_TENSOR_CACHE: dict[tuple[str, int, str, int], torch.Tensor] = {}
+RESIZE_MODE_SQUARE = "square"
+RESIZE_MODE_SMALLER_EDGE = "smaller_edge"
+RESIZE_MODES = (
+    RESIZE_MODE_SQUARE,
+    RESIZE_MODE_SMALLER_EDGE,
+)
 
 
 @dataclass(frozen=True)
@@ -58,43 +64,138 @@ def _normalize_rgb_array(rgb_array: np.ndarray) -> np.ndarray:
     return rgb_array
 
 
+def _ceil_to_multiple(value: int, multiple: int) -> int:
+    if multiple <= 1:
+        return max(1, int(value))
+    return max(int(multiple), int(((int(value) + int(multiple) - 1) // int(multiple)) * int(multiple)))
+
+
+def _normalize_output_size(image_size: int | tuple[int, int]) -> tuple[int, int]:
+    if isinstance(image_size, tuple):
+        height, width = image_size
+        return int(height), int(width)
+    size = int(image_size)
+    return size, size
+
+
+def resolve_image_resize_size(
+    image_size: int,
+    original_height: int,
+    original_width: int,
+    resize_mode: str = RESIZE_MODE_SQUARE,
+    patch_multiple: int = 14,
+) -> tuple[int, int]:
+    target_size = int(image_size)
+    if resize_mode == RESIZE_MODE_SQUARE:
+        return target_size, target_size
+    if resize_mode != RESIZE_MODE_SMALLER_EDGE:
+        raise ValueError(f"Unsupported resize_mode: {resize_mode}")
+    if original_height <= 0 or original_width <= 0:
+        raise ValueError(f"Invalid original image size: {(original_height, original_width)}")
+    scale = float(target_size) / float(min(original_height, original_width))
+    resized_height = max(1, int(round(float(original_height) * scale)))
+    resized_width = max(1, int(round(float(original_width) * scale)))
+    return (
+        _ceil_to_multiple(resized_height, int(patch_multiple)),
+        _ceil_to_multiple(resized_width, int(patch_multiple)),
+    )
+
+
+def resize_pil_image(
+    image: Image.Image,
+    image_size: int,
+    resize_mode: str = RESIZE_MODE_SQUARE,
+    patch_multiple: int = 14,
+    resample: int = Image.BICUBIC,
+) -> Image.Image:
+    output_height, output_width = resolve_image_resize_size(
+        image_size=image_size,
+        original_height=int(image.height),
+        original_width=int(image.width),
+        resize_mode=resize_mode,
+        patch_multiple=patch_multiple,
+    )
+    return image.resize((output_width, output_height), resample=resample)
+
+
 class ImageTransform:
-    def __init__(self, image_size: int, augment: bool = False) -> None:
+    def __init__(
+        self,
+        image_size: int,
+        augment: bool = False,
+        resize_mode: str = RESIZE_MODE_SQUARE,
+        patch_multiple: int = 14,
+    ) -> None:
         self.image_size = image_size
         self.augment = augment
+        self.resize_mode = str(resize_mode)
+        self.patch_multiple = int(patch_multiple)
 
     def __call__(self, path: Path) -> torch.Tensor:
         image = Image.open(path).convert("RGB")
         if self.augment and random.random() < 0.5:
             image = image.transpose(Image.FLIP_LEFT_RIGHT)
-        resized = image.resize((self.image_size, self.image_size), resample=Image.BICUBIC)
+        resized = resize_pil_image(
+            image=image,
+            image_size=self.image_size,
+            resize_mode=self.resize_mode,
+            patch_multiple=self.patch_multiple,
+            resample=Image.BICUBIC,
+        )
         rgb_array = _normalize_rgb_array(np.asarray(resized, dtype=np.float32))
         return torch.from_numpy(rgb_array.transpose(2, 0, 1))
 
 
-def load_image_rgb(path: str | Path, image_size: int) -> np.ndarray:
+def load_image_rgb(
+    path: str | Path,
+    image_size: int,
+    resize_mode: str = RESIZE_MODE_SQUARE,
+    patch_multiple: int = 14,
+) -> np.ndarray:
     image = Image.open(path).convert("RGB")
-    resized = image.resize((image_size, image_size), resample=Image.BICUBIC)
+    resized = resize_pil_image(
+        image=image,
+        image_size=image_size,
+        resize_mode=resize_mode,
+        patch_multiple=patch_multiple,
+        resample=Image.BICUBIC,
+    )
     return np.asarray(resized, dtype=np.uint8)
 
 
-def load_mask_array(mask_path: str | Path | None, image_size: int) -> np.ndarray:
+def load_mask_array(mask_path: str | Path | None, image_size: int | tuple[int, int]) -> np.ndarray:
+    output_height, output_width = _normalize_output_size(image_size)
     if mask_path is None:
-        return np.zeros((image_size, image_size), dtype=np.float32)
+        return np.zeros((output_height, output_width), dtype=np.float32)
     mask = Image.open(mask_path).convert("L")
-    resized = mask.resize((image_size, image_size), resample=Image.NEAREST)
+    resized = mask.resize((output_width, output_height), resample=Image.NEAREST)
     mask_array = np.asarray(resized, dtype=np.float32)
     return (mask_array > 0).astype(np.float32)
 
 
-def load_support_tensor_cached(path: str | Path, image_size: int) -> torch.Tensor:
+def load_support_tensor_cached(
+    path: str | Path,
+    image_size: int,
+    resize_mode: str = RESIZE_MODE_SQUARE,
+    patch_multiple: int = 14,
+) -> torch.Tensor:
     resolved_path = Path(path).resolve()
-    cache_key = (str(resolved_path), int(image_size))
+    cache_key = (
+        str(resolved_path),
+        int(image_size),
+        str(resize_mode),
+        int(patch_multiple),
+    )
     cached = _SUPPORT_TENSOR_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
-    transform = ImageTransform(image_size=image_size, augment=False)
+    transform = ImageTransform(
+        image_size=image_size,
+        augment=False,
+        resize_mode=resize_mode,
+        patch_multiple=patch_multiple,
+    )
     tensor = transform(resolved_path).contiguous()
     _SUPPORT_TENSOR_CACHE[cache_key] = tensor
     return tensor

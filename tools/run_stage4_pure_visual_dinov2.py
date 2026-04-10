@@ -11,6 +11,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from scipy import ndimage
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms.functional import rotate as tv_rotate
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -18,12 +20,23 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from fewshot.coreset import greedy_farthest_point_coreset
-from fewshot.data import build_shared_split_manifest, load_mask_array, load_shared_split_manifest, save_shared_split_manifest
+from fewshot.data import (
+    RESIZE_MODE_SMALLER_EDGE,
+    RESIZE_MODE_SQUARE,
+    RESIZE_MODES,
+    build_shared_split_manifest,
+    load_mask_array,
+    load_shared_split_manifest,
+    save_shared_split_manifest,
+)
 from fewshot.dinov2_backbone import (
+    FEATURE_CACHE_VERSION,
     DinoV2PatchEncoder,
     FEATURE_SOURCE_LAST,
     FEATURE_SOURCE_LAST4_MEAN,
     FEATURE_SOURCES,
+    FEATURE_VIEW_BASE,
+    FEATURE_VIEW_OBJECT_NORMALIZED,
     flatten_patch_map,
     load_dinov2_feature_cache_batch,
     populate_dinov2_feature_cache,
@@ -54,12 +67,18 @@ METHOD_PATCHCORE_KNN = "patchcore_knn"
 METHOD_PATCHCORE_DEFECT_BOOST = "patchcore_defect_boost"
 METHOD_PATCHCORE_LOCAL_SCALE = "patchcore_local_scale"
 METHOD_PATCHCORE_SUPPORT_CONSENSUS = "patchcore_support_consensus"
+METHOD_PATCHCORE_SUPPORT_CONSENSUS_DEFECT_BOOST = "patchcore_support_consensus_defect_boost"
+METHOD_PATCHCORE_MATCH_REWEIGHT = "patchcore_match_reweight"
+METHOD_PATCHCORE_SUPPORTAWARE_PREPROC_CONSENSUS = "patchcore_supportaware_preproc_consensus"
 METHOD_GLOBAL_SUBSPACE = "global_subspace"
 METHODS = (
     METHOD_PATCHCORE_KNN,
     METHOD_PATCHCORE_DEFECT_BOOST,
     METHOD_PATCHCORE_LOCAL_SCALE,
     METHOD_PATCHCORE_SUPPORT_CONSENSUS,
+    METHOD_PATCHCORE_SUPPORT_CONSENSUS_DEFECT_BOOST,
+    METHOD_PATCHCORE_MATCH_REWEIGHT,
+    METHOD_PATCHCORE_SUPPORTAWARE_PREPROC_CONSENSUS,
     METHOD_GLOBAL_SUBSPACE,
 )
 CONTROL_CATEGORY = "bottle"
@@ -80,12 +99,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--holdout-fraction", type=float, default=0.25)
     parser.add_argument("--backbone", default="dinov2_vits14")
     parser.add_argument("--image-size", type=int, default=448)
+    parser.add_argument("--resize-mode", choices=RESIZE_MODES, default=RESIZE_MODE_SQUARE)
+    parser.add_argument("--resize-patch-multiple", type=int, default=14)
     parser.add_argument("--feature-sources", nargs="+", default=[FEATURE_SOURCE_LAST, FEATURE_SOURCE_LAST4_MEAN], choices=FEATURE_SOURCES)
     parser.add_argument("--methods", nargs="+", default=[METHOD_PATCHCORE_KNN, METHOD_GLOBAL_SUBSPACE], choices=METHODS)
     parser.add_argument("--knn-topks", nargs="+", type=int, default=[1, 3])
     parser.add_argument("--defect-boost-weights", nargs="+", type=float, default=[0.25, 0.5, 1.0])
     parser.add_argument("--local-scale-neighbor-topks", nargs="+", type=int, default=[8, 16])
     parser.add_argument("--support-consensus-topks", nargs="+", type=int, default=[4, 8])
+    parser.add_argument("--match-reweight-alphas", nargs="+", type=float, default=[5.0, 10.0])
+    parser.add_argument("--preproc-agreement-betas", nargs="+", type=float, default=[8.0])
     parser.add_argument("--coreset-ratios", nargs="+", type=float, default=[1.0, 0.05])
     parser.add_argument("--subspace-dims", nargs="+", type=int, default=[32, 64, 128])
     parser.add_argument("--topk-ratio", type=float, default=0.01)
@@ -165,6 +188,19 @@ def ratio_tag(value: float) -> str:
     return f"{int(round(float(value) * 1000)):03d}"
 
 
+def resize_mode_tag(resize_mode: str, patch_multiple: int) -> str:
+    return f"{slug(resize_mode)}_pm{int(patch_multiple):03d}"
+
+
+def patch_batch_output_size(patch_batch: torch.Tensor, patch_multiple: int) -> tuple[int, int]:
+    if patch_batch.ndim != 4:
+        raise ValueError(f"Expected a 4D patch batch, got shape {tuple(patch_batch.shape)}")
+    return (
+        int(patch_batch.shape[-2]) * int(patch_multiple),
+        int(patch_batch.shape[-1]) * int(patch_multiple),
+    )
+
+
 def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
     fieldnames: list[str] = []
     for row in rows:
@@ -196,6 +232,53 @@ def split_support_holdout(support_normal, holdout_fraction: float, seed: int):
     support_train = [sample for idx, sample in enumerate(items) if idx not in holdout_indices]
     support_holdout = [sample for idx, sample in enumerate(items) if idx in holdout_indices]
     return support_train, support_holdout
+
+
+OFFICIAL_ROTATION_ANGLES = (0, 45, 90, 135, 180, 225, 270, 315)
+
+
+def _rotation_safe_mask(mask: torch.Tensor) -> torch.Tensor:
+    if mask.ndim == 2:
+        mask = mask.unsqueeze(0)
+    return mask
+
+
+def rotate_patch_map_and_mask(patch_map: torch.Tensor, mask: torch.Tensor, angle: float) -> tuple[torch.Tensor, torch.Tensor]:
+    rotated_patch = tv_rotate(
+        patch_map,
+        angle=float(angle),
+        interpolation=InterpolationMode.BILINEAR,
+        expand=False,
+        fill=0,
+    )
+    rotated_mask = tv_rotate(
+        _rotation_safe_mask(mask).float(),
+        angle=float(angle),
+        interpolation=InterpolationMode.NEAREST,
+        expand=False,
+        fill=0,
+    ).to(dtype=torch.bool)
+    rotated_patch = rotated_patch * rotated_mask.to(dtype=rotated_patch.dtype)
+    return rotated_patch, rotated_mask
+
+
+def augment_patch_batch_with_rotations(
+    patch_batch: torch.Tensor,
+    mask_batch: torch.Tensor,
+    angles: tuple[int, ...] = OFFICIAL_ROTATION_ANGLES,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rotated_batches: list[torch.Tensor] = []
+    rotated_masks: list[torch.Tensor] = []
+    for angle in angles:
+        for patch_map, mask in zip(patch_batch, mask_batch, strict=True):
+            rotated_patch, rotated_mask = rotate_patch_map_and_mask(patch_map, mask, angle=float(angle))
+            rotated_batches.append(rotated_patch)
+            rotated_masks.append(rotated_mask)
+    return torch.stack(rotated_batches, dim=0), torch.stack(rotated_masks, dim=0)
+
+
+def foreground_mask_from_patch_batch(patch_batch: torch.Tensor) -> torch.Tensor:
+    return patch_batch.abs().sum(dim=1, keepdim=True) > 1e-6
 
 
 def average_precision_score(labels: list[int], scores: list[float]) -> float:
@@ -297,36 +380,96 @@ def connected_component_masks(mask: np.ndarray) -> list[np.ndarray]:
     return [(labeled == label_id) for label_id in range(1, num + 1)]
 
 
-def pro_score(mask_arrays: list[np.ndarray], score_maps: list[np.ndarray], max_fpr: float = 0.3, num_thresholds: int = 200) -> float:
+def trapezoid(x: np.ndarray, y: np.ndarray, x_max: float | None = None) -> float:
+    x = np.asarray(x)
+    y = np.asarray(y)
+    finite_mask = np.logical_and(np.isfinite(x), np.isfinite(y))
+    x = x[finite_mask]
+    y = y[finite_mask]
+    correction = 0.0
+    if x_max is not None:
+        if x_max not in x:
+            insert_at = int(np.searchsorted(x, x_max))
+            if 0 < insert_at < len(x):
+                y_interp = y[insert_at - 1] + ((y[insert_at] - y[insert_at - 1]) * (x_max - x[insert_at - 1]) / (x[insert_at] - x[insert_at - 1]))
+                correction = 0.5 * (y_interp + y[insert_at - 1]) * (x_max - x[insert_at - 1])
+        mask = x <= x_max
+        x = x[mask]
+        y = y[mask]
+    if len(x) < 2:
+        return float("nan")
+    return float(np.sum(0.5 * (y[1:] + y[:-1]) * (x[1:] - x[:-1])) + correction)
+
+
+def pro_score(mask_arrays: list[np.ndarray], score_maps: list[np.ndarray], max_fpr: float = 0.3) -> float:
     if not mask_arrays or not score_maps:
         return float("nan")
-    all_scores = np.concatenate([score.reshape(-1) for score in score_maps], axis=0)
-    negative_scores = np.concatenate([score[mask <= 0.5].reshape(-1) for mask, score in zip(mask_arrays, score_maps)], axis=0)
-    regions = [connected_component_masks(mask) for mask in mask_arrays]
-    num_regions = sum(len(items) for items in regions)
-    if num_regions == 0 or negative_scores.size == 0:
+
+    structure = np.ones((3, 3), dtype=int)
+    num_ok_pixels = 0
+    num_gt_regions = 0
+
+    shape = (len(score_maps), score_maps[0].shape[0], score_maps[0].shape[1])
+    fp_changes = np.zeros(shape, dtype=np.uint32)
+    pro_changes = np.zeros(shape, dtype=np.float64)
+
+    for gt_ind, gt_map in enumerate(mask_arrays):
+        labeled, n_components = ndimage.label(gt_map > 0.5, structure)
+        num_gt_regions += n_components
+
+        ok_mask = labeled == 0
+        num_ok_pixels += int(np.sum(ok_mask))
+
+        fp_change = np.zeros_like(gt_map, dtype=fp_changes.dtype)
+        fp_change[ok_mask] = 1
+
+        pro_change = np.zeros_like(gt_map, dtype=np.float64)
+        for k in range(n_components):
+            region_mask = labeled == (k + 1)
+            region_size = int(np.sum(region_mask))
+            if region_size > 0:
+                pro_change[region_mask] = 1.0 / float(region_size)
+
+        fp_changes[gt_ind, :, :] = fp_change
+        pro_changes[gt_ind, :, :] = pro_change
+
+    if num_ok_pixels <= 0 or num_gt_regions <= 0:
         return float("nan")
-    thresholds = np.linspace(float(all_scores.max()), float(all_scores.min()), num_thresholds)
-    fprs: list[float] = []
-    pros: list[float] = []
-    for threshold in thresholds:
-        fpr = float((negative_scores >= threshold).mean())
-        if fpr > max_fpr:
-            continue
-        overlaps: list[float] = []
-        for region_set, score_map in zip(regions, score_maps):
-            pred = score_map >= threshold
-            for region_mask in region_set:
-                overlaps.append(float(pred[region_mask].mean()))
-        if overlaps:
-            fprs.append(fpr)
-            pros.append(float(np.mean(overlaps)))
-    if len(fprs) < 2:
-        return float("nan")
-    order = np.argsort(fprs)
-    normalized_fpr = np.asarray(fprs, dtype=np.float64)[order] / max_fpr
-    pro_values = np.asarray(pros, dtype=np.float64)[order]
-    return float(np.trapezoid(pro_values, normalized_fpr))
+
+    anomaly_scores_flat = np.array(score_maps).ravel()
+    fp_changes_flat = fp_changes.ravel()
+    pro_changes_flat = pro_changes.ravel()
+
+    sort_idxs = np.argsort(anomaly_scores_flat).astype(np.uint32)[::-1]
+    np.take(anomaly_scores_flat, sort_idxs, out=anomaly_scores_flat)
+    anomaly_scores_sorted = anomaly_scores_flat
+    np.take(fp_changes_flat, sort_idxs, out=fp_changes_flat)
+    fp_changes_sorted = fp_changes_flat
+    np.take(pro_changes_flat, sort_idxs, out=pro_changes_flat)
+    pro_changes_sorted = pro_changes_flat
+
+    np.cumsum(fp_changes_sorted, out=fp_changes_sorted)
+    fp_changes_sorted = fp_changes_sorted.astype(np.float32, copy=False)
+    np.divide(fp_changes_sorted, num_ok_pixels, out=fp_changes_sorted)
+    fprs = fp_changes_sorted
+
+    np.cumsum(pro_changes_sorted, out=pro_changes_sorted)
+    np.divide(pro_changes_sorted, num_gt_regions, out=pro_changes_sorted)
+    pros = pro_changes_sorted
+
+    keep_mask = np.append(np.diff(anomaly_scores_sorted) != 0, np.True_)
+    fprs = fprs[keep_mask]
+    pros = pros[keep_mask]
+
+    np.clip(fprs, a_min=None, a_max=1.0, out=fprs)
+    np.clip(pros, a_min=None, a_max=1.0, out=pros)
+
+    zero = np.array([0.0])
+    one = np.array([1.0])
+    fprs = np.concatenate((zero, fprs, one))
+    pros = np.concatenate((zero, pros, one))
+
+    return float(trapezoid(fprs, pros, x_max=max_fpr) / max_fpr)
 
 
 def stage4_baseline_paths(subset: str) -> dict[str, Path]:
@@ -379,6 +522,8 @@ def build_candidate_configs(args: argparse.Namespace) -> list[dict[str, object]]
                             "knn_topk": int(knn_topk),
                             "coreset_ratio": float(coreset_ratio),
                             "topk_ratio": float(args.topk_ratio),
+                            "resize_mode": str(args.resize_mode),
+                            "resize_patch_multiple": int(args.resize_patch_multiple),
                         }
                     )
         if METHOD_PATCHCORE_DEFECT_BOOST in args.methods:
@@ -393,6 +538,8 @@ def build_candidate_configs(args: argparse.Namespace) -> list[dict[str, object]]
                                 "defect_boost_weight": float(defect_boost_weight),
                                 "coreset_ratio": float(coreset_ratio),
                                 "topk_ratio": float(args.topk_ratio),
+                                "resize_mode": str(args.resize_mode),
+                                "resize_patch_multiple": int(args.resize_patch_multiple),
                             }
                         )
         if METHOD_PATCHCORE_LOCAL_SCALE in args.methods:
@@ -407,6 +554,8 @@ def build_candidate_configs(args: argparse.Namespace) -> list[dict[str, object]]
                                 "local_scale_neighbor_topk": int(local_scale_neighbor_topk),
                                 "coreset_ratio": float(coreset_ratio),
                                 "topk_ratio": float(args.topk_ratio),
+                                "resize_mode": str(args.resize_mode),
+                                "resize_patch_multiple": int(args.resize_patch_multiple),
                             }
                         )
         if METHOD_PATCHCORE_SUPPORT_CONSENSUS in args.methods:
@@ -421,8 +570,64 @@ def build_candidate_configs(args: argparse.Namespace) -> list[dict[str, object]]
                                 "support_consensus_topk": int(support_consensus_topk),
                                 "coreset_ratio": float(coreset_ratio),
                                 "topk_ratio": float(args.topk_ratio),
+                                "resize_mode": str(args.resize_mode),
+                                "resize_patch_multiple": int(args.resize_patch_multiple),
                             }
                         )
+        if METHOD_PATCHCORE_SUPPORT_CONSENSUS_DEFECT_BOOST in args.methods:
+            for knn_topk in args.knn_topks:
+                for support_consensus_topk in args.support_consensus_topks:
+                    for defect_boost_weight in args.defect_boost_weights:
+                        for coreset_ratio in args.coreset_ratios:
+                            configs.append(
+                                {
+                                    "method": METHOD_PATCHCORE_SUPPORT_CONSENSUS_DEFECT_BOOST,
+                                    "feature_source": feature_source,
+                                    "knn_topk": int(knn_topk),
+                                    "support_consensus_topk": int(support_consensus_topk),
+                                    "defect_boost_weight": float(defect_boost_weight),
+                                    "coreset_ratio": float(coreset_ratio),
+                                    "topk_ratio": float(args.topk_ratio),
+                                    "resize_mode": str(args.resize_mode),
+                                    "resize_patch_multiple": int(args.resize_patch_multiple),
+                                }
+                            )
+        if METHOD_PATCHCORE_MATCH_REWEIGHT in args.methods:
+            for knn_topk in args.knn_topks:
+                for support_consensus_topk in args.support_consensus_topks:
+                    for match_reweight_alpha in args.match_reweight_alphas:
+                        for coreset_ratio in args.coreset_ratios:
+                            configs.append(
+                                {
+                                    "method": METHOD_PATCHCORE_MATCH_REWEIGHT,
+                                    "feature_source": feature_source,
+                                    "knn_topk": int(knn_topk),
+                                    "support_consensus_topk": int(support_consensus_topk),
+                                    "match_reweight_alpha": float(match_reweight_alpha),
+                                    "coreset_ratio": float(coreset_ratio),
+                                    "topk_ratio": float(args.topk_ratio),
+                                    "resize_mode": str(args.resize_mode),
+                                    "resize_patch_multiple": int(args.resize_patch_multiple),
+                                }
+                            )
+        if METHOD_PATCHCORE_SUPPORTAWARE_PREPROC_CONSENSUS in args.methods:
+            for knn_topk in args.knn_topks:
+                for support_consensus_topk in args.support_consensus_topks:
+                    for preproc_agreement_beta in args.preproc_agreement_betas:
+                        for coreset_ratio in args.coreset_ratios:
+                            configs.append(
+                                {
+                                    "method": METHOD_PATCHCORE_SUPPORTAWARE_PREPROC_CONSENSUS,
+                                    "feature_source": feature_source,
+                                    "knn_topk": int(knn_topk),
+                                    "support_consensus_topk": int(support_consensus_topk),
+                                    "preproc_agreement_beta": float(preproc_agreement_beta),
+                                    "coreset_ratio": float(coreset_ratio),
+                                    "topk_ratio": float(args.topk_ratio),
+                                    "resize_mode": str(args.resize_mode),
+                                    "resize_patch_multiple": int(args.resize_patch_multiple),
+                                }
+                            )
         if METHOD_GLOBAL_SUBSPACE in args.methods:
             for subspace_dim in args.subspace_dims:
                 for coreset_ratio in args.coreset_ratios:
@@ -433,18 +638,34 @@ def build_candidate_configs(args: argparse.Namespace) -> list[dict[str, object]]
                             "subspace_dim": int(subspace_dim),
                             "coreset_ratio": float(coreset_ratio),
                             "topk_ratio": float(args.topk_ratio),
+                            "resize_mode": str(args.resize_mode),
+                            "resize_patch_multiple": int(args.resize_patch_multiple),
                         }
                     )
     return configs
 
 
 def candidate_name(backbone: str, config: dict[str, object]) -> str:
-    parts = [slug(backbone), slug(str(config["feature_source"])), slug(str(config["method"]))]
+    method_label_map = {
+        METHOD_PATCHCORE_KNN: "patchcore_knn",
+        METHOD_PATCHCORE_DEFECT_BOOST: "pc_defboost",
+        METHOD_PATCHCORE_LOCAL_SCALE: "pc_localscale",
+        METHOD_PATCHCORE_SUPPORT_CONSENSUS: "pc_consensus",
+        METHOD_PATCHCORE_SUPPORT_CONSENSUS_DEFECT_BOOST: "pc_consensus_defboost",
+        METHOD_PATCHCORE_MATCH_REWEIGHT: "pc_matchrw",
+        METHOD_PATCHCORE_SUPPORTAWARE_PREPROC_CONSENSUS: "pc_preproc_consensus",
+        METHOD_GLOBAL_SUBSPACE: "global_subspace",
+    }
+    method_label = method_label_map.get(str(config["method"]), str(config["method"]))
+    parts = [slug(backbone), slug(str(config["feature_source"])), slug(method_label)]
     if config["method"] in (
         METHOD_PATCHCORE_KNN,
         METHOD_PATCHCORE_DEFECT_BOOST,
         METHOD_PATCHCORE_LOCAL_SCALE,
         METHOD_PATCHCORE_SUPPORT_CONSENSUS,
+        METHOD_PATCHCORE_SUPPORT_CONSENSUS_DEFECT_BOOST,
+        METHOD_PATCHCORE_MATCH_REWEIGHT,
+        METHOD_PATCHCORE_SUPPORTAWARE_PREPROC_CONSENSUS,
     ):
         parts.append(f"k{int(config['knn_topk']):03d}")
     if config["method"] == METHOD_PATCHCORE_DEFECT_BOOST:
@@ -453,10 +674,29 @@ def candidate_name(backbone: str, config: dict[str, object]) -> str:
         parts.append(f"scale{int(config['local_scale_neighbor_topk']):03d}")
     if config["method"] == METHOD_PATCHCORE_SUPPORT_CONSENSUS:
         parts.append(f"cons{int(config['support_consensus_topk']):03d}")
+    if config["method"] == METHOD_PATCHCORE_SUPPORT_CONSENSUS_DEFECT_BOOST:
+        parts.append(f"cons{int(config['support_consensus_topk']):03d}")
+        parts.append(f"boost{ratio_tag(float(config['defect_boost_weight']))}")
+    if config["method"] == METHOD_PATCHCORE_MATCH_REWEIGHT:
+        parts.append(f"cons{int(config['support_consensus_topk']):03d}")
+        parts.append(f"alpha{ratio_tag(float(config['match_reweight_alpha']))}")
+    if config["method"] == METHOD_PATCHCORE_SUPPORTAWARE_PREPROC_CONSENSUS:
+        parts.append(f"cons{int(config['support_consensus_topk']):03d}")
+        parts.append(f"beta{ratio_tag(float(config['preproc_agreement_beta']))}")
     if config["method"] == METHOD_GLOBAL_SUBSPACE:
         parts.append(f"dim{int(config['subspace_dim']):03d}")
     parts.append(f"core{ratio_tag(float(config['coreset_ratio']))}")
     parts.append(f"topk{ratio_tag(float(config['topk_ratio']))}")
+    if (
+        str(config.get("resize_mode", RESIZE_MODE_SQUARE)) != RESIZE_MODE_SQUARE
+        or int(config.get("resize_patch_multiple", 14)) != 14
+    ):
+        parts.append(
+            resize_mode_tag(
+                resize_mode=str(config.get("resize_mode", RESIZE_MODE_SQUARE)),
+                patch_multiple=int(config.get("resize_patch_multiple", 14)),
+            )
+        )
     return "_".join(parts)
 
 
@@ -571,7 +811,38 @@ def patchcore_support_consensus_score_map(
     support_patch_bank: torch.Tensor,
     knn_topk: int,
     support_consensus_topk: int,
-) -> torch.Tensor:
+    return_best_normal_similarity: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    batch_size, channels, height, width = query_patch_map.shape
+    query_rows = F.normalize(query_patch_map, dim=1, eps=1e-6).permute(0, 2, 3, 1).reshape(-1, channels)
+    per_support_distances: list[torch.Tensor] = []
+    per_support_similarities: list[torch.Tensor] = []
+    for support_index in range(support_patch_bank.shape[0]):
+        support_rows = support_patch_bank[support_index].permute(1, 2, 0).reshape(-1, channels)
+        support_rows = F.normalize(support_rows, dim=1, eps=1e-6)
+        similarities = query_rows @ support_rows.t()
+        k = max(1, min(int(knn_topk), similarities.shape[1]))
+        if k == 1:
+            similarity = similarities.max(dim=1).values
+        else:
+            similarity = similarities.topk(k=k, dim=1).values.mean(dim=1)
+        per_support_similarities.append(similarity)
+        per_support_distances.append(1.0 - similarity)
+    stacked = torch.stack(per_support_distances, dim=1)
+    consensus_k = max(1, min(int(support_consensus_topk), stacked.shape[1]))
+    consensus_distance = stacked.topk(k=consensus_k, dim=1, largest=False).values.mean(dim=1)
+    consensus_map = consensus_distance.view(batch_size, 1, height, width)
+    if not return_best_normal_similarity:
+        return consensus_map
+    best_normal_similarity = torch.stack(per_support_similarities, dim=1).max(dim=1).values
+    return consensus_map, best_normal_similarity.view(batch_size, 1, height, width)
+
+
+def support_distance_stack(
+    query_patch_map: torch.Tensor,
+    support_patch_bank: torch.Tensor,
+    knn_topk: int,
+) -> tuple[torch.Tensor, int, int, int]:
     batch_size, channels, height, width = query_patch_map.shape
     query_rows = F.normalize(query_patch_map, dim=1, eps=1e-6).permute(0, 2, 3, 1).reshape(-1, channels)
     per_support_distances: list[torch.Tensor] = []
@@ -585,10 +856,114 @@ def patchcore_support_consensus_score_map(
         else:
             similarity = similarities.topk(k=k, dim=1).values.mean(dim=1)
         per_support_distances.append(1.0 - similarity)
-    stacked = torch.stack(per_support_distances, dim=1)
-    consensus_k = max(1, min(int(support_consensus_topk), stacked.shape[1]))
-    consensus_distance = stacked.topk(k=consensus_k, dim=1, largest=False).values.mean(dim=1)
-    return consensus_distance.view(batch_size, 1, height, width)
+    return torch.stack(per_support_distances, dim=1), batch_size, height, width
+
+
+def consensus_distance_and_weight(
+    distance_stack: torch.Tensor,
+    support_consensus_topk: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    consensus_k = max(1, min(int(support_consensus_topk), distance_stack.shape[1]))
+    nearest_distances = distance_stack.topk(k=consensus_k, dim=1, largest=False).values
+    consensus_distance = nearest_distances.mean(dim=1)
+    dispersion = nearest_distances.std(dim=1, unbiased=False)
+    support_weight = consensus_distance / (consensus_distance + dispersion + 1e-6)
+    return consensus_distance, support_weight.clamp_(0.0, 1.0)
+
+
+def patchcore_support_consensus_defect_boost_score_map(
+    query_patch_map: torch.Tensor,
+    support_patch_bank: torch.Tensor,
+    defect_reference_bank: torch.Tensor,
+    knn_topk: int,
+    support_consensus_topk: int,
+    defect_boost_weight: float,
+) -> torch.Tensor:
+    consensus_map, best_normal_similarity_map = patchcore_support_consensus_score_map(
+        query_patch_map=query_patch_map,
+        support_patch_bank=support_patch_bank,
+        knn_topk=knn_topk,
+        support_consensus_topk=support_consensus_topk,
+        return_best_normal_similarity=True,
+    )
+    batch_size, _, height, width = consensus_map.shape
+    channels = query_patch_map.shape[1]
+    query_rows = F.normalize(query_patch_map, dim=1, eps=1e-6).permute(0, 2, 3, 1).reshape(-1, channels)
+    defect_reference_bank = F.normalize(defect_reference_bank, dim=1, eps=1e-6)
+    defect_similarities = query_rows @ defect_reference_bank.t()
+    k_defect = max(1, min(int(knn_topk), defect_similarities.shape[1]))
+    if k_defect == 1:
+        defect_similarity = defect_similarities.max(dim=1).values
+    else:
+        defect_similarity = defect_similarities.topk(k=k_defect, dim=1).values.mean(dim=1)
+    defect_similarity_map = defect_similarity.view(batch_size, 1, height, width)
+    defect_margin = torch.relu(defect_similarity_map - best_normal_similarity_map)
+    return consensus_map + float(defect_boost_weight) * defect_margin
+
+
+def patchcore_match_reweight_score_map(
+    query_patch_map: torch.Tensor,
+    support_patch_bank: torch.Tensor,
+    knn_topk: int,
+    support_consensus_topk: int,
+    match_reweight_alpha: float,
+) -> torch.Tensor:
+    batch_size, channels, height, width = query_patch_map.shape
+    query_rows = F.normalize(query_patch_map, dim=1, eps=1e-6).permute(0, 2, 3, 1).reshape(-1, channels)
+    per_support_distances: list[torch.Tensor] = []
+    per_support_similarities: list[torch.Tensor] = []
+    for support_index in range(support_patch_bank.shape[0]):
+        support_rows = support_patch_bank[support_index].permute(1, 2, 0).reshape(-1, channels)
+        support_rows = F.normalize(support_rows, dim=1, eps=1e-6)
+        similarities = query_rows @ support_rows.t()
+        k = max(1, min(int(knn_topk), similarities.shape[1]))
+        if k == 1:
+            similarity = similarities.max(dim=1).values
+        else:
+            similarity = similarities.topk(k=k, dim=1).values.mean(dim=1)
+        per_support_similarities.append(similarity)
+        per_support_distances.append(1.0 - similarity)
+    distance_stack = torch.stack(per_support_distances, dim=1)
+    similarity_stack = torch.stack(per_support_similarities, dim=1)
+    consensus_k = max(1, min(int(support_consensus_topk), distance_stack.shape[1]))
+    top_values, top_indices = similarity_stack.topk(k=consensus_k, dim=1)
+    gathered_distances = distance_stack.gather(dim=1, index=top_indices)
+    weights = torch.softmax(float(match_reweight_alpha) * top_values, dim=1)
+    weighted_distance = (weights * gathered_distances).sum(dim=1)
+    return weighted_distance.view(batch_size, 1, height, width)
+
+
+def patchcore_supportaware_preproc_consensus_score_map(
+    query_patch_map: torch.Tensor,
+    object_normalized_query_patch_map: torch.Tensor,
+    support_patch_bank: torch.Tensor,
+    object_normalized_support_patch_bank: torch.Tensor,
+    knn_topk: int,
+    support_consensus_topk: int,
+    preproc_agreement_beta: float,
+) -> torch.Tensor:
+    base_distance_stack, batch_size, height, width = support_distance_stack(
+        query_patch_map=query_patch_map,
+        support_patch_bank=support_patch_bank,
+        knn_topk=knn_topk,
+    )
+    normalized_distance_stack, _, _, _ = support_distance_stack(
+        query_patch_map=object_normalized_query_patch_map,
+        support_patch_bank=object_normalized_support_patch_bank,
+        knn_topk=knn_topk,
+    )
+    base_distance, base_support_weight = consensus_distance_and_weight(
+        distance_stack=base_distance_stack,
+        support_consensus_topk=support_consensus_topk,
+    )
+    normalized_distance, normalized_support_weight = consensus_distance_and_weight(
+        distance_stack=normalized_distance_stack,
+        support_consensus_topk=support_consensus_topk,
+    )
+    view_agreement = torch.exp(-float(preproc_agreement_beta) * torch.abs(base_distance - normalized_distance))
+    support_agreement = torch.sqrt((base_support_weight * normalized_support_weight).clamp_min(0.0))
+    anomaly = torch.minimum(base_distance, normalized_distance) * support_agreement * view_agreement
+    return anomaly.view(batch_size, 1, height, width)
 
 
 def fit_global_subspace(reference_bank: torch.Tensor, max_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -624,6 +999,8 @@ def score_patch_batch(
     defect_bank: torch.Tensor | None = None,
     reference_local_radii: torch.Tensor | None = None,
     support_patch_bank: torch.Tensor | None = None,
+    object_normalized_patch_batch: torch.Tensor | None = None,
+    object_normalized_support_patch_bank: torch.Tensor | None = None,
     subspace_mean: torch.Tensor | None = None,
     subspace_basis: torch.Tensor | None = None,
 ) -> tuple[list[float], list[np.ndarray]]:
@@ -655,6 +1032,33 @@ def score_patch_batch(
             knn_topk=int(config["knn_topk"]),
             support_consensus_topk=int(config["support_consensus_topk"]),
         )
+    elif config["method"] == METHOD_PATCHCORE_SUPPORT_CONSENSUS_DEFECT_BOOST:
+        anomaly_map = patchcore_support_consensus_defect_boost_score_map(
+            query_patch_map=patch_batch,
+            support_patch_bank=support_patch_bank,
+            defect_reference_bank=defect_bank,
+            knn_topk=int(config["knn_topk"]),
+            support_consensus_topk=int(config["support_consensus_topk"]),
+            defect_boost_weight=float(config["defect_boost_weight"]),
+        )
+    elif config["method"] == METHOD_PATCHCORE_MATCH_REWEIGHT:
+        anomaly_map = patchcore_match_reweight_score_map(
+            query_patch_map=patch_batch,
+            support_patch_bank=support_patch_bank,
+            knn_topk=int(config["knn_topk"]),
+            support_consensus_topk=int(config["support_consensus_topk"]),
+            match_reweight_alpha=float(config["match_reweight_alpha"]),
+        )
+    elif config["method"] == METHOD_PATCHCORE_SUPPORTAWARE_PREPROC_CONSENSUS:
+        anomaly_map = patchcore_supportaware_preproc_consensus_score_map(
+            query_patch_map=patch_batch,
+            object_normalized_query_patch_map=object_normalized_patch_batch,
+            support_patch_bank=support_patch_bank,
+            object_normalized_support_patch_bank=object_normalized_support_patch_bank,
+            knn_topk=int(config["knn_topk"]),
+            support_consensus_topk=int(config["support_consensus_topk"]),
+            preproc_agreement_beta=float(config["preproc_agreement_beta"]),
+        )
     elif config["method"] == METHOD_GLOBAL_SUBSPACE:
         anomaly_map = global_subspace_score_map(
             query_patch_map=patch_batch,
@@ -663,9 +1067,13 @@ def score_patch_batch(
         )
     else:
         raise ValueError(f"Unsupported method: {config['method']}")
+    output_size = patch_batch_output_size(
+        patch_batch=patch_batch,
+        patch_multiple=int(config.get("resize_patch_multiple", 14)),
+    )
     scored = score_map_outputs(
         score_map=anomaly_map,
-        image_size=patch_batch.shape[-1] * 14,
+        image_size=output_size,
         topk_ratio=float(config["topk_ratio"]),
         aggregation_mode=AGGREGATION_MODE_TOPK_MEAN,
         aggregation_stage="patch",
@@ -698,13 +1106,16 @@ def prepare_reference_variants(
 def evaluate_split_scores(
     patch_batch_cpu: torch.Tensor,
     config: dict[str, object],
-    image_size: int,
+    output_size: int | tuple[int, int],
     device: torch.device,
     score_batch_size: int,
     reference_bank: torch.Tensor | None = None,
     defect_bank: torch.Tensor | None = None,
     reference_local_radii: torch.Tensor | None = None,
     support_patch_bank: torch.Tensor | None = None,
+    object_normalized_patch_batch_cpu: torch.Tensor | None = None,
+    object_normalized_support_patch_bank: torch.Tensor | None = None,
+    patch_mask_cpu: torch.Tensor | None = None,
     subspace_mean: torch.Tensor | None = None,
     subspace_basis: torch.Tensor | None = None,
 ) -> tuple[list[float], list[np.ndarray]]:
@@ -713,6 +1124,12 @@ def evaluate_split_scores(
     for start in range(0, patch_batch_cpu.shape[0], int(score_batch_size)):
         end = min(patch_batch_cpu.shape[0], start + int(score_batch_size))
         patch_batch = patch_batch_cpu[start:end].to(device)
+        object_normalized_patch_batch = None
+        if object_normalized_patch_batch_cpu is not None:
+            object_normalized_patch_batch = object_normalized_patch_batch_cpu[start:end].to(device)
+        patch_mask_batch = None
+        if patch_mask_cpu is not None:
+            patch_mask_batch = patch_mask_cpu[start:end].to(device)
         if config["method"] == METHOD_PATCHCORE_KNN:
             anomaly_map = patchcore_knn_score_map(
                 query_patch_map=patch_batch,
@@ -741,15 +1158,44 @@ def evaluate_split_scores(
                 knn_topk=int(config["knn_topk"]),
                 support_consensus_topk=int(config["support_consensus_topk"]),
             )
+        elif config["method"] == METHOD_PATCHCORE_SUPPORT_CONSENSUS_DEFECT_BOOST:
+            anomaly_map = patchcore_support_consensus_defect_boost_score_map(
+                query_patch_map=patch_batch,
+                support_patch_bank=support_patch_bank,
+                defect_reference_bank=defect_bank,
+                knn_topk=int(config["knn_topk"]),
+                support_consensus_topk=int(config["support_consensus_topk"]),
+                defect_boost_weight=float(config["defect_boost_weight"]),
+            )
+        elif config["method"] == METHOD_PATCHCORE_MATCH_REWEIGHT:
+            anomaly_map = patchcore_match_reweight_score_map(
+                query_patch_map=patch_batch,
+                support_patch_bank=support_patch_bank,
+                knn_topk=int(config["knn_topk"]),
+                support_consensus_topk=int(config["support_consensus_topk"]),
+                match_reweight_alpha=float(config["match_reweight_alpha"]),
+            )
+        elif config["method"] == METHOD_PATCHCORE_SUPPORTAWARE_PREPROC_CONSENSUS:
+            anomaly_map = patchcore_supportaware_preproc_consensus_score_map(
+                query_patch_map=patch_batch,
+                object_normalized_query_patch_map=object_normalized_patch_batch,
+                support_patch_bank=support_patch_bank,
+                object_normalized_support_patch_bank=object_normalized_support_patch_bank,
+                knn_topk=int(config["knn_topk"]),
+                support_consensus_topk=int(config["support_consensus_topk"]),
+                preproc_agreement_beta=float(config["preproc_agreement_beta"]),
+            )
         else:
             anomaly_map = global_subspace_score_map(
                 query_patch_map=patch_batch,
                 mean=subspace_mean,
                 basis=subspace_basis,
             )
+        if patch_mask_batch is not None:
+            anomaly_map = anomaly_map * patch_mask_batch.to(dtype=anomaly_map.dtype)
         scored = score_map_outputs(
             score_map=anomaly_map,
-            image_size=int(image_size),
+            image_size=output_size,
             topk_ratio=float(config["topk_ratio"]),
             aggregation_mode=AGGREGATION_MODE_TOPK_MEAN,
             aggregation_stage="patch",
@@ -901,7 +1347,25 @@ def evaluate_category_candidate(
     seed: int,
 ) -> tuple[dict[str, object], dict[str, object], list[str]]:
     feature_source = str(config["feature_source"])
-    category_cache_dir = Path(args.feature_cache_root) / slug(args.backbone) / f"img{int(args.image_size):03d}" / feature_source / category
+    resize_mode = str(config.get("resize_mode", args.resize_mode))
+    resize_patch_multiple = int(config.get("resize_patch_multiple", args.resize_patch_multiple))
+    cache_variant = (
+        f"multiview_{FEATURE_CACHE_VERSION}"
+        if config["method"] == METHOD_PATCHCORE_SUPPORTAWARE_PREPROC_CONSENSUS
+        else f"base_{FEATURE_CACHE_VERSION}"
+    )
+    size_root = Path(args.feature_cache_root) / slug(args.backbone)
+    size_tag = f"img{int(args.image_size):03d}"
+    if resize_mode == RESIZE_MODE_SQUARE and resize_patch_multiple == 14:
+        category_cache_dir = size_root / size_tag / feature_source / category / cache_variant
+    else:
+        category_cache_dir = (
+            size_root
+            / f"{size_tag}_{resize_mode_tag(resize_mode=resize_mode, patch_multiple=resize_patch_multiple)}"
+            / feature_source
+            / category
+            / cache_variant
+        )
     all_paths = [str(sample.path) for sample in [*support_train, *support_holdout, *manifest.support_defect, *manifest.query_eval]]
     cache_start = time.time()
     written = populate_dinov2_feature_cache(
@@ -909,6 +1373,8 @@ def evaluate_category_candidate(
         image_paths=all_paths,
         cache_dir=category_cache_dir,
         image_size=args.image_size,
+        resize_mode=resize_mode,
+        patch_multiple=resize_patch_multiple,
         feature_source=feature_source,
         batch_size=args.batch_size,
         workers=args.workers,
@@ -919,33 +1385,76 @@ def evaluate_category_candidate(
         [sample.path for sample in support_train],
         cache_dir=category_cache_dir,
         device=None,
+        view=FEATURE_VIEW_BASE,
     )
     holdout_patch, _ = load_dinov2_feature_cache_batch(
         [sample.path for sample in support_holdout],
         cache_dir=category_cache_dir,
         device=None,
+        view=FEATURE_VIEW_BASE,
     )
     defect_patch, _ = load_dinov2_feature_cache_batch(
         [sample.path for sample in manifest.support_defect],
         cache_dir=category_cache_dir,
         device=None,
+        view=FEATURE_VIEW_BASE,
     )
     query_patch, _ = load_dinov2_feature_cache_batch(
         [sample.path for sample in manifest.query_eval],
         cache_dir=category_cache_dir,
         device=None,
+        view=FEATURE_VIEW_BASE,
+    )
+    support_train_object_normalized_patch, _ = load_dinov2_feature_cache_batch(
+        [sample.path for sample in support_train],
+        cache_dir=category_cache_dir,
+        device=None,
+        view=FEATURE_VIEW_OBJECT_NORMALIZED,
+    )
+    holdout_object_normalized_patch, _ = load_dinov2_feature_cache_batch(
+        [sample.path for sample in support_holdout],
+        cache_dir=category_cache_dir,
+        device=None,
+        view=FEATURE_VIEW_OBJECT_NORMALIZED,
+    )
+    defect_object_normalized_patch, _ = load_dinov2_feature_cache_batch(
+        [sample.path for sample in manifest.support_defect],
+        cache_dir=category_cache_dir,
+        device=None,
+        view=FEATURE_VIEW_OBJECT_NORMALIZED,
+    )
+    query_object_normalized_patch, _ = load_dinov2_feature_cache_batch(
+        [sample.path for sample in manifest.query_eval],
+        cache_dir=category_cache_dir,
+        device=None,
+        view=FEATURE_VIEW_OBJECT_NORMALIZED,
     )
 
+    support_train_mask = foreground_mask_from_patch_batch(support_train_object_normalized_patch)
+    holdout_mask = foreground_mask_from_patch_batch(holdout_object_normalized_patch)
+    defect_mask = foreground_mask_from_patch_batch(defect_object_normalized_patch)
+    query_mask = foreground_mask_from_patch_batch(query_object_normalized_patch)
+
+    support_train_patch_aug, support_train_mask_aug = augment_patch_batch_with_rotations(
+        support_train_patch,
+        support_train_mask,
+    )
+    support_train_object_normalized_patch_aug = support_train_patch_aug * support_train_mask_aug.to(dtype=support_train_patch_aug.dtype)
+    holdout_output_size = patch_batch_output_size(holdout_patch, resize_patch_multiple)
+    defect_output_size = patch_batch_output_size(defect_patch, resize_patch_multiple)
+    query_output_size = patch_batch_output_size(query_patch, resize_patch_multiple)
+
     reference_variants = prepare_reference_variants(
-        support_patch_batch=support_train_patch,
+        support_patch_batch=support_train_object_normalized_patch_aug,
         coreset_ratios=args.coreset_ratios,
         device=device,
         seed=seed,
     )
     reference_bank = reference_variants[float(config["coreset_ratio"])]
-    defect_bank = flatten_patch_map(defect_patch.to(device))
+    defect_bank = flatten_patch_map(defect_object_normalized_patch.to(device))
     reference_local_radii = None
-    support_patch_bank = support_train_patch.to(device)
+    support_patch_bank = support_train_patch_aug.to(device)
+    object_normalized_support_patch_bank = support_train_object_normalized_patch_aug.to(device)
     subspace_mean = None
     subspace_basis = None
     if config["method"] == METHOD_GLOBAL_SUBSPACE:
@@ -962,26 +1471,32 @@ def evaluate_category_candidate(
     holdout_scores_normal, _ = evaluate_split_scores(
         patch_batch_cpu=holdout_patch,
         config=config,
-        image_size=args.image_size,
+        output_size=holdout_output_size,
         device=device,
         score_batch_size=args.score_batch_size,
         reference_bank=reference_bank,
         defect_bank=defect_bank,
         reference_local_radii=reference_local_radii,
         support_patch_bank=support_patch_bank,
+        object_normalized_patch_batch_cpu=holdout_object_normalized_patch,
+        object_normalized_support_patch_bank=object_normalized_support_patch_bank,
+        patch_mask_cpu=holdout_mask,
         subspace_mean=subspace_mean,
         subspace_basis=subspace_basis,
     )
     holdout_scores_defect, _ = evaluate_split_scores(
         patch_batch_cpu=defect_patch,
         config=config,
-        image_size=args.image_size,
+        output_size=defect_output_size,
         device=device,
         score_batch_size=args.score_batch_size,
         reference_bank=reference_bank,
         defect_bank=defect_bank,
         reference_local_radii=reference_local_radii,
         support_patch_bank=support_patch_bank,
+        object_normalized_patch_batch_cpu=defect_object_normalized_patch,
+        object_normalized_support_patch_bank=object_normalized_support_patch_bank,
+        patch_mask_cpu=defect_mask,
         subspace_mean=subspace_mean,
         subspace_basis=subspace_basis,
     )
@@ -992,13 +1507,16 @@ def evaluate_category_candidate(
     query_scores, query_score_maps = evaluate_split_scores(
         patch_batch_cpu=query_patch,
         config=config,
-        image_size=args.image_size,
+        output_size=query_output_size,
         device=device,
         score_batch_size=args.score_batch_size,
         reference_bank=reference_bank,
         defect_bank=defect_bank,
         reference_local_radii=reference_local_radii,
         support_patch_bank=support_patch_bank,
+        object_normalized_patch_batch_cpu=query_object_normalized_patch,
+        object_normalized_support_patch_bank=object_normalized_support_patch_bank,
+        patch_mask_cpu=query_mask,
         subspace_mean=subspace_mean,
         subspace_basis=subspace_basis,
     )
@@ -1007,7 +1525,7 @@ def evaluate_category_candidate(
         scores=query_scores,
         threshold_map=threshold_map,
     )
-    masks = [load_mask_array(sample.mask_path, image_size=args.image_size) for sample in manifest.query_eval]
+    masks = [load_mask_array(sample.mask_path, image_size=query_output_size) for sample in manifest.query_eval]
     pixel_auroc_value = pixel_auroc(masks, query_score_maps)
     pro_value = pro_score(masks, query_score_maps)
     category_row = dict(per_category_rows[0])
@@ -1021,7 +1539,13 @@ def evaluate_category_candidate(
             "defect_boost_weight": float(config.get("defect_boost_weight", 0.0)),
             "local_scale_neighbor_topk": int(config.get("local_scale_neighbor_topk", 0)),
             "support_consensus_topk": int(config.get("support_consensus_topk", 0)),
+            "match_reweight_alpha": float(config.get("match_reweight_alpha", 0.0)),
+            "preproc_agreement_beta": float(config.get("preproc_agreement_beta", 0.0)),
             "subspace_dim": int(config.get("subspace_dim", 0)),
+            "resize_mode": resize_mode,
+            "resize_patch_multiple": resize_patch_multiple,
+            "resolved_image_height": int(query_output_size[0]),
+            "resolved_image_width": int(query_output_size[1]),
             "pixel_auroc": float(pixel_auroc_value),
             "pro": float(pro_value),
             "num_support_train": len(support_train),
@@ -1045,6 +1569,10 @@ def evaluate_category_candidate(
             **config,
             "backbone": args.backbone,
             "image_size": args.image_size,
+            "resize_mode": resize_mode,
+            "resize_patch_multiple": resize_patch_multiple,
+            "resolved_image_height": int(query_output_size[0]),
+            "resolved_image_width": int(query_output_size[1]),
             "topk_ratio": args.topk_ratio,
             "holdout_fraction": args.holdout_fraction,
             "seed": seed,
@@ -1124,7 +1652,11 @@ def build_experiment_row(
         "defect_boost_weight": float(config.get("defect_boost_weight", 0.0)),
         "local_scale_neighbor_topk": int(config.get("local_scale_neighbor_topk", 0)),
         "support_consensus_topk": int(config.get("support_consensus_topk", 0)),
+        "match_reweight_alpha": float(config.get("match_reweight_alpha", 0.0)),
+        "preproc_agreement_beta": float(config.get("preproc_agreement_beta", 0.0)),
         "subspace_dim": int(config.get("subspace_dim", 0)),
+        "resize_mode": str(config.get("resize_mode", RESIZE_MODE_SQUARE)),
+        "resize_patch_multiple": int(config.get("resize_patch_multiple", 14)),
         "threshold_source": "per_category_support_holdout_plus_support_defect_best_balanced_accuracy",
     }
     e0 = baseline_refs["stage2_e0"]
@@ -1188,6 +1720,9 @@ def main() -> None:
             "seeds": args.seeds,
             "categories": args.categories,
             "backbone": args.backbone,
+            "image_size": int(args.image_size),
+            "resize_mode": str(args.resize_mode),
+            "resize_patch_multiple": int(args.resize_patch_multiple),
             "risks": [
                 "DINOv2 patch memory is substantially larger than the old CLIP cache.",
                 "Retained baseline uses support-defect only for threshold calibration; support-aware variants add defect-bank retrieval boosts.",
@@ -1209,6 +1744,9 @@ def main() -> None:
         "output_dir": str(output_root),
         "categories": args.categories,
         "seeds": args.seeds,
+        "image_size": int(args.image_size),
+        "resize_mode": str(args.resize_mode),
+        "resize_patch_multiple": int(args.resize_patch_multiple),
         "num_candidates": len(candidate_configs),
         "candidates": [],
     }

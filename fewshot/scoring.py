@@ -41,8 +41,16 @@ def topk_mean(score_map: torch.Tensor, topk_ratio: float = 0.1) -> torch.Tensor:
     return values.mean(dim=1)
 
 
-def upsample_score_map(score_map: torch.Tensor, size: int) -> torch.Tensor:
-    return F.interpolate(score_map, size=(size, size), mode="bilinear", align_corners=False)
+def _normalize_spatial_size(size: int | tuple[int, int]) -> tuple[int, int]:
+    if isinstance(size, tuple):
+        height, width = size
+        return int(height), int(width)
+    scalar = int(size)
+    return scalar, scalar
+
+
+def upsample_score_map(score_map: torch.Tensor, size: int | tuple[int, int]) -> torch.Tensor:
+    return F.interpolate(score_map, size=_normalize_spatial_size(size), mode="bilinear", align_corners=False)
 
 
 def aggregate_image_score(
@@ -146,7 +154,7 @@ def build_score_map(
 
 def score_map_outputs(
     score_map: torch.Tensor,
-    image_size: int,
+    image_size: int | tuple[int, int],
     topk_ratio: float = 0.1,
     aggregation_mode: str = AGGREGATION_MODE_TOPK_MEAN,
     aggregation_stage: str = AGGREGATION_STAGE_UPSAMPLED,
@@ -172,7 +180,7 @@ def score_map_outputs(
 
 def logits_to_score_outputs(
     score_logits: torch.Tensor,
-    image_size: int,
+    image_size: int | tuple[int, int],
     topk_ratio: float = 0.1,
 ) -> dict[str, torch.Tensor]:
     upsampled_logits = upsample_score_map(score_logits, size=image_size)
