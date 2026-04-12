@@ -1,0 +1,202 @@
+我判断这轮“越对齐越差”，**大概率不是一个单点 bug**，而是你把 AnomalyDINO 里几项**强依赖上下文的启发式预处理**，移植到了一个**并不等价的 pure-visual 近似实现**里，结果同时破坏了三件事：
+
+**方法契约、几何契约、评测契约。**
+
+先说最核心的一句：**AnomalyDINO 的 rotation/mask/preprocess 不是“对任何 DINOv2+PatchCore 变体都成立的通用插件”。** 官方论文自己就写得很谨慎：合适的 preprocessing（是否 masking、是否 augment）**取决于对象类别特性**；他们用的是 **category-dependent** 的处理，而不是全局统一开启。正文还说，加入这套 preprocessing，在他们自己的 exact pipeline 里平均只带来大约 **2% detection AUROC** 提升，不是那种“插上必涨”的大招。([openaccess.thecvf.com](https://openaccess.thecvf.com/content/WACV2025/papers/Damm_AnomalyDINO_Boosting_Patch-Based_Few-Shot_Anomaly_Detection_with_DINOv2_WACV_2025_paper.pdf))
+同时，你当前 repo 的 pure-visual retained winner 3-seed 是 `image AUROC 0.9744 ± 0.0025 / pixel AUROC 0.9702 ± 0.0005 / PRO 0.8634 ± 0.0049`，这说明你已经有一条很强但**定位仍低于官方 AnomalyDINO PRO 口径**的本地实现。
+
+## 我认为最可能的原因，按置信度排序
+
+### 1）最高置信度：你把 **mask 用在了不该用的位置**
+
+官方 AnomalyDINO 的 masking 逻辑是这样的：
+
+* **在 test time 选择 relevant patch representations**，也就是在做 NN matching 之前过滤 query 端 patch；
+* 他们专门说明：在 few-shot 下，**masking 只用在 test samples**，因为 memory bank 大小在这个 regime 里不是主要问题。([openaccess.thecvf.com](https://openaccess.thecvf.com/content/WACV2025/papers/Damm_AnomalyDINO_Boosting_Patch-Based_Few-Shot_Anomaly_Detection_with_DINOv2_WACV_2025_paper.pdf), [openaccess.thecvf.com](https://openaccess.thecvf.com/content/WACV2025/supplemental/Damm_AnomalyDINO_Boosting_Patch-Based_WACV_2025_supplemental.pdf))
+
+而你这轮做的是：
+
+* 用前景 mask 改 **support/reference bank**；
+* 用前景 mask 改 **anomaly map**；
+* 甚至还一起改了 PRO 评测口径。
+
+这在技术上已经不是同一件事了。
+
+为什么这会更差？
+
+因为 **test-only mask** 的目标是“少让背景 query patch 进 kNN”；
+而 **support/reference bank mask** 的效果是“直接把 normal manifold 砍薄”。
+few-shot 本来 support 就少，你再把 support 边界 patch、弱纹理 patch、背景-前景过渡 patch 削掉，memory bank 的覆盖会明显变差。对 kNN 来说，这不是去噪，而是**删掉合法 normal 变化**。这会直接降低最近邻匹配的可达性，尤其伤 localization。
+
+同样，如果你是**先算 anomaly map 再乘一个 mask**，那也和官方不是一回事。官方是在 **kNN 前过滤 patch**；你如果在 **score map 后硬裁掉**，会把边界处本来应该保留的高分像素直接归零，这对 PRO 尤其致命，因为 PRO 非常吃区域边界和小缺陷覆盖。([openaccess.thecvf.com](https://openaccess.thecvf.com/content/WACV2025/papers/Damm_AnomalyDINO_Boosting_Patch-Based_Few-Shot_Anomaly_Detection_with_DINOv2_WACV_2025_paper.pdf))
+
+### 2）高置信度：你把 **category-conditional heuristic** 变成了 **global heuristic**
+
+官方论文没有说“所有类都 mask、所有类都 rotate”。相反，它明确说：
+
+* 是否 mask / 是否 rotate，取决于 object characteristics；
+* texture 类一般**不 mask**；
+* PCA-based mask 对某些类会失败，比如 close-up、目标占 patch 太多时容易错；
+* rotation 对 `screw` 这类可能是好事，但对“旋转本身就是异常”的类会有害。([openaccess.thecvf.com](https://openaccess.thecvf.com/content/WACV2025/papers/Damm_AnomalyDINO_Boosting_Patch-Based_Few-Shot_Anomaly_Detection_with_DINOv2_WACV_2025_paper.pdf), [openaccess.thecvf.com](https://openaccess.thecvf.com/content/WACV2025/supplemental/Damm_AnomalyDINO_Boosting_Patch-Based_WACV_2025_supplemental.pdf))
+
+这点非常关键。
+你的“越对齐越差”其实很可能恰恰说明：**你对齐的是 paper 的表面组件，不是它的决策逻辑。**
+
+比如论文自己就举了 `Transistor` 的反例：如果你在 agnostic setting 下总是做 rotation augmentation，某些“位置/旋转异常”会被 normal bank 吞掉。补充材料里甚至给了很直观的例子：一个 misplaced transistor，在带 rotation 的参考下反而不容易被检出。([openaccess.thecvf.com](https://openaccess.thecvf.com/content/WACV2025/supplemental/Damm_AnomalyDINO_Boosting_Patch-Based_WACV_2025_supplemental.pdf))
+
+所以，如果你现在是：
+
+* 对所有类都扩 support/reference rotation；
+* 对所有类都做前景 mask；
+* 对所有 anomaly map 都强行乘 mask；
+
+那出现整体退化并不反常。
+**你不是把 paper 复现差了，而是把 paper 里“按类生效的 recipe”统一硬编码成了全局开关。**
+
+### 3）高置信度：你在 **几何/分辨率契约** 上没有真正对齐，尤其是 smaller-edge / aspect-ratio / 672
+
+官方 AnomalyDINO 用的是 **smaller-edge 448/672**，并且利用 DINOv2 可以处理**保持纵横比的变分辨率输入**；正文还专门说，448 是性能和速度的最好 trade-off，更高分辨率有时会带来更高 detection AUROC，但不是“越大越好”。([openaccess.thecvf.com](https://openaccess.thecvf.com/content/WACV2025/papers/Damm_AnomalyDINO_Boosting_Patch-Based_Few-Shot_Anomaly_Detection_with_DINOv2_WACV_2025_paper.pdf))
+
+而你当前本地 runner 里有一个非常可疑的点：**下游 scoring/upsampling 仍然是围绕一个标量 `image_size` 在跑**，也就是把 anomaly map 统一投回一个单一尺寸。
+
+这意味着，如果你引入了：
+
+* smaller-edge；
+* aspect-ratio preserved resize；
+* 672 resolution；
+
+但没有把 **patch grid → pixel map 的投影**、**mask 的形态学操作尺度**、**PRO 的像素对齐** 一起完整重写，那你很容易出现下面这种现象：
+
+* image AUROC 变化不大；
+* pixel AUROC 略波动；
+* **PRO 明显掉**。
+
+原因很简单：
+PRO 比 image AUROC 更依赖**边界和区域几何一致性**。
+一旦你的 patch map 和原图 mask 的对齐不是完全严格的，或者你把长宽比保持和后端 square upsample 混在一起，区域 overlap 指标会先坏。
+
+换句话说，**“我把输入预处理对齐到 smaller-edge / aspect-ratio 了”不等于“整条 pipeline 的几何语义对齐了”。**
+这是我认为你现在最值得优先 audit 的一项。
+
+### 4）中高置信度：rotation 扩 support/reference 以后，**bank 不是更稳，而是更“宽松”了**
+
+paper 里 rotation 的作用，不是神奇增强，而是**用更大的 nominal variation 去覆盖 normality**。
+这在 `screw` 上往往是合理的，因为它天然需要旋转不变性；但在 few-shot regime 里，rotation augmentation 还有一个副作用：
+
+**它会让 kNN 更容易找到“看起来差不多”的 normal patch，从而把 anomaly contrast 压平。**
+
+尤其在你这种近似实现里，如果：
+
+* support 本来就少；
+* 你又把同一张 support 旋转出多个近重复 bank patch；
+* 还用了 k=1 或很小的 k；
+
+那么 query patch 很可能过早地被这些“广义 normal”吸走。结果就是：
+
+* image-level 排序未必差很多；
+* 但 anomaly map 的局部峰值被削平；
+* 小缺陷、边缘缺陷、细长结构缺陷的 **PRO 先掉**。
+
+这类退化在 `zipper / screw / transistor` 这种结构类上会更明显。官方也明确说，rotation 在少数例子里会负作用，不是无害操作。([openaccess.thecvf.com](https://openaccess.thecvf.com/content/WACV2025/papers/Damm_AnomalyDINO_Boosting_Patch-Based_Few-Shot_Anomaly_Detection_with_DINOv2_WACV_2025_paper.pdf))
+
+### 5）中高置信度：你“把 PRO 评测口径往官方靠”之后，看到的部分变差，可能只是 **指标更诚实了**
+
+这点也要单独说。
+你现在 repo 里的 pure-visual 3-seed retained winner，`PRO = 0.8634`。
+而官方 paper 在 MVTec few-shot 上，672 口径的 PRO 可以到 `92.7 / 93.1 / 93.8 / 94.8 / 95.3 / 94.0` 这类水平，说明你本地 localization 还有 gap。([openaccess.thecvf.com](https://openaccess.thecvf.com/content/WACV2025/papers/Damm_AnomalyDINO_Boosting_Patch-Based_Few-Shot_Anomaly_Detection_with_DINOv2_WACV_2025_paper.pdf))
+
+但你这次“往官方靠”的过程中，有一部分“变差”不一定是模型坏了，而可能是：
+
+* PRO 实现更严格了；
+* map 与 GT 的重叠统计更真实了；
+* 边界和小区域不再被宽松实现“抹平后误判成高 overlap”。
+
+也就是说：
+
+**如果只是 PRO 数字掉了，而可视化 overlay 没明显更差，那要先怀疑 metric contract 变严格了。**
+这和“模型真的坏了”是两回事。
+
+### 6）中等置信度：你的本地 pure-visual 线和官方 AnomalyDINO **协议仍不等价**
+
+这点很容易被忽略，但我认为很重要。
+你现在这条 DINOv2 pure-visual runner 并不是 paper 的 exact code path。当前脚本里仍然存在：
+
+* `support_holdout + support_defect` 做 per-category threshold 选择；
+* 本地 split/holdout 逻辑；
+* 自己的 cache / score_map / summary 管线。
+
+而官方 AnomalyDINO 的 few-shot 主体设定是：
+**nominal reference sample(s) → memory bank → query patch NN matching**，核心结果是基于 retrieval score 得到的 detection/localization 指标。([openaccess.thecvf.com](https://openaccess.thecvf.com/content/WACV2025/papers/Damm_AnomalyDINO_Boosting_Patch-Based_Few-Shot_Anomaly_Detection_with_DINOv2_WACV_2025_paper.pdf))
+
+这意味着一个很现实的问题：
+
+你现在做的是 **“用官方 preprocessing 去增强一个近似但不等价的本地 system”**，
+不是 **“把官方 system 完整复现后再做 ablation”**。
+
+所以出现“preprocessing transplant 后更差”，完全可能。
+它不一定证明 preprocessing 没用，更可能证明：
+
+**这些 preprocessing 与你的 current protocol 不是模块化兼容的。**
+
+---
+
+## 这件事更像“代码问题”还是“方法本身的问题”？
+
+我的判断是：
+
+**整体上更像“实现/协议错配”多于“方法本身就这样”。**
+
+理由有两个。
+
+第一，官方 paper 明确显示这条 family 在 MVTec few-shot 上的 localization 可以做到比你当前本地实现更高的 PRO，因此“DINOv2 + patch retrieval 本来就只有 86 左右 PRO”这个解释站不住。([openaccess.thecvf.com](https://openaccess.thecvf.com/content/WACV2025/papers/Damm_AnomalyDINO_Boosting_Patch-Based_Few-Shot_Anomaly_Detection_with_DINOv2_WACV_2025_paper.pdf))
+
+第二，paper 自己也承认 preprocessing 是**类条件、协议条件**下才成立的。
+也就是说，方法本身确实有脆弱点，但你现在观察到的“越对齐越差”更像是：
+**把一个本来就很细粒度依赖场景的 recipe，错误地硬移植到了不同 contract 的实现里。**
+
+不过，像 `screw` 这种类的退化，我不会完全归咎于 bug。
+`hard structural class` 本来就是这类方法的真实脆弱点之一；只是你现在的 gap 看起来已经大到**不只是类难度**，还包含了明显的实现/几何对齐问题。
+
+---
+
+## 我建议你下一步不要继续“大包式对齐”，而是做 4 个最小诊断实验
+
+这四个实验能最快把原因拆开：
+
+### A. 只加 **test-only patch filtering**，别动 bank、别动 anomaly map
+
+目标：验证真正有用的是不是“query 端去背景”。
+如果这个版本能回升，而 “bank mask / map mask” 版本继续差，那主因就很明确了。
+
+### B. 把 **rotation** 只开在 paper 明显受益的类别上，别全类开
+
+至少先单独测：
+
+* `screw / hazelnut / metal_nut` 这类旋转不变需求更强的类；
+* `transistor / zipper` 这类更可能被方向语义伤到的类。
+  如果全局 rotation 差、按类 rotation 好，那说明你现在的问题不是 rotation 这个想法错，而是 **gating strategy 错**。
+
+### C. 回退到 **square 448**，只测 mask/rotation，不碰 aspect-ratio / smaller-edge / 672
+
+目标：先把几何变量关掉。
+如果 square 448 下 preprocessing 有效，而 smaller-edge/672 一上就坏，那问题就在 **patch-grid → pixel-map 对齐**，不是 preprocessing 本身。
+
+### D. 固定同一 score map，分别用“旧 PRO”和“官方 PRO”去算
+
+目标：判断“变差”里有多少是 metric honesty。
+如果同一张图的 map，官方 PRO 显著更低，但视觉上没差太多，那你现在至少知道：
+**有一部分下降来自评测更严，不来自模型。**
+
+---
+
+## 最后一句判断
+
+如果让我只押一个最可能的主因，我会押：
+
+**你把 AnomalyDINO 的 preprocessing，从“test-time, category-conditional, pre-NN patch filtering”
+变成了“support/reference/anomaly-map 全链路硬注入”，再叠加 aspect-ratio / smaller-edge / 672 这种几何变化，结果先把 localization contract 搞坏了。**
+
+也就是说，
+**不是你没对齐 paper，而是你对齐的是组件，不是组件在 pipeline 里的职责。**
+
+你要的话，我下一条可以直接给你写一份 **“AnomalyDINO 对齐失败诊断清单”**，按代码级检查项列成 10 条，每条都对应你现在 repo 最该看的地方。
