@@ -1,0 +1,12 @@
+[
+  {
+    "experiment": "dinov2_vits14_last_patchcore_knn_k001_core1000_topk010_refb_defb_qmps_qpcl_rpcl",
+    "seed": 42,
+    "alerts": []
+  },
+  {
+    "experiment": "dinov2_vits14_last_patchcore_knn_k001_core1000_topk010_refb_defb_qmps_qpcl_rpcl",
+    "seed": 43,
+    "alerts": []
+  }
+]
